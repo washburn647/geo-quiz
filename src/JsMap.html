@@ -1,0 +1,378 @@
+<script>
+// MapView: draws a pack as SVG with pan / pinch / wheel zoom, taps, labels and pop-up names.
+//   opt.onTap(i, event)   i = place index or -1
+//   opt.static            no panning or zooming (thumbnails)
+//   opt.buttons           show + / − / fit buttons
+// Road packs (pack.kind === 'roads') draw places as lines over the state's towns, with a
+// wide invisible stroke to tap or drop on, labels that slide along the road, and town names.
+function MapView(host, pack, opt) {
+  opt = opt || {};
+  const P = pack.places;
+  const outer = host;
+  outer.innerHTML = '';
+  host = document.createElement('div');
+  host.className = 'mvhost';
+  outer.appendChild(host);
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  const ROADS = pack.kind === 'roads';
+  svg.setAttribute('class', ROADS ? 'mv roads' : 'mv');
+  svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+  let html = '<rect x="-50000" y="-50000" width="110000" height="110000" fill="transparent"/>';
+  html += '<g class="ctx">' + pack.ctx.map((c) => '<path d="' + c.d + '"/>').join('') + '</g>';
+  if (ROADS) {
+    html += '<path class="base" d="' + (pack.base || '') + '"/><path class="lakes" d="' + (pack.lakes || '') + '"/><path class="stline" d="' + (pack.outline || '') + '"/>';
+    html += '<g class="pl">' + P.map((p, i) => '<path class="' + (p.g ? 'g1' : 'g0') + '" d="' + p.d + '" data-i="' + i + '"/>').join('') + '</g>';
+    html += '<g class="hit">' + P.map((p, i) => '<path d="' + p.d + '" data-i="' + i + '"/>').join('') + '</g>';
+    html += '<g class="tw">' + (pack.towns || []).map((t, j) => '<circle cx="' + t.lx + '" cy="' + t.ly + '" r="30" data-t="' + j + '" style="display:none"/>').join('')
+      + (pack.towns || []).map((t, j) => '<text x="' + t.lx + '" y="' + t.ly + '" data-t="' + j + '" style="display:none">' + esc(t.n) + '</text>').join('') + '</g>';
+  } else {
+    html += '<g class="pl">' + P.map((p, i) => '<path d="' + p.d + '" data-i="' + i + '"/>').join('') + '</g>';
+    html += '<path class="lakes" d="' + (pack.lakes || '') + '"/>';
+  }
+  html += '<path class="glines" d="' + (pack.lines || '') + '"/>';
+  if (!ROADS) html += '<path class="outline" style="display:none" d="' + (pack.outline || '') + '"/>';
+  html += '<g class="frames">' + (pack.frames || []).map((f) => '<rect x="' + f[0] + '" y="' + f[1] + '" width="' + f[2] + '" height="' + f[3] + '"/>').join('') + '</g>';
+  html += '<g class="mk">' + P.map((p, i) => p.m ? '<circle cx="' + p.lx + '" cy="' + p.ly + '" r="40" data-i="' + i + '"/>' : '').join('') + '</g>';
+  html += '<g class="lb">' + P.map((p, i) => '<text x="' + p.lx + '" y="' + p.ly + '" data-i="' + i + '" style="display:none">' + esc(p.n) + '</text>').join('') + '</g>';
+  html += '<g class="clb">' + pack.ctx.map((c) => c.n ? '<text class="c" x="' + c.lx + '" y="' + c.ly + '" style="display:none">' + esc(c.n) + '</text>' : '').join('') + '</g>';
+  svg.innerHTML = html;
+  host.appendChild(svg);
+  const paths = $$('.pl path', svg), texts = $$('.lb text', svg), ctexts = $$('.clb text', svg);
+  const ctxLabeled = pack.ctx.filter((c) => c.n);
+  const towns = pack.towns || [];
+  const tdots = $$('.tw circle', svg), ttexts = $$('.tw text', svg);
+  const townSt = new Array(towns.length).fill(0); // 0 auto, 1 always, -1 never
+  let townMode = 'auto';
+  // spots along each road where its label may sit (worked out on first use)
+  const spots = ROADS ? new Array(P.length).fill(null) : null;
+  const spotsOf = (i) => {
+    if (spots[i]) return spots[i];
+    const el = paths[i];
+    const L = el.getTotalLength();
+    const out = [];
+    for (let k = 1; k < 12; k++) { const pt = el.getPointAtLength(L * k / 12); out.push([pt.x, pt.y]); }
+    return (spots[i] = out);
+  };
+  const marks = {};
+  $$('.mk circle', svg).forEach((c) => { marks[c.dataset.i] = c; });
+
+  const lab = new Array(P.length).fill(0); // 0 hidden, 1 normal, 2 always, 3 dim
+  const labText = new Array(P.length).fill(null);
+  let showCtx = true;
+  const v = { x: 0, y: 0, w: pack.w, h: pack.h };
+  let cw = 1, ch = 1, u = 1;
+  let home = [0, 0, pack.w, pack.h];
+  const maxU = () => Math.max(pack.w, pack.h) / Math.min(cw, ch) * 1.6;
+  const minU = () => pack.w / cw / 80;
+
+  function measure() { const r = host.getBoundingClientRect(); cw = Math.max(1, r.width); ch = Math.max(1, r.height); }
+  function apply() {
+    u = v.w / cw;
+    v.h = ch * u;
+    svg.setAttribute('viewBox', v.x + ' ' + v.y + ' ' + v.w + ' ' + v.h);
+    svg.style.setProperty('--u', u);
+    const r = u * 7;
+    for (const k in marks) marks[k].setAttribute('r', r);
+    tdots.forEach((c) => c.setAttribute('r', u * (c.classList.contains('big') ? 7 : 3.2)));
+    scheduleCull();
+    if (opt.onView) opt.onView();
+  }
+  let cullT = 0;
+  function scheduleCull() { if (!cullT) cullT = requestAnimationFrame(() => { cullT = 0; cull(); }); }
+  function cull() {
+    const vx1 = v.x + v.w, vy1 = v.y + v.h;
+    if (ROADS) { cullRoads(vx1, vy1); return; }
+    for (let i = 0; i < P.length; i++) {
+      const st = lab[i], t = texts[i];
+      let show = false;
+      if (st) {
+        const p = P[i];
+        const inView = p.lx > v.x && p.lx < vx1 && p.ly > v.y && p.ly < vy1;
+        if (inView) {
+          if (st === 2) show = true;
+          else {
+            const pw = (p.bb[2] - p.bb[0]) / u, ph = (p.bb[3] - p.bb[1]) / u;
+            const tw = (labText[i] || p.n).length * 6.4;
+            show = (pw > tw * 0.8 && ph > 12) || (p.m && pw * 30 > tw && st !== 3);
+          }
+        }
+      }
+      const want = show ? '' : 'none';
+      if (t.style.display !== want) t.style.display = want;
+    }
+    ctexts.forEach((t, j) => {
+      const c = ctxLabeled[j];
+      const show = showCtx && Math.sqrt(c.a) / u > c.n.length * 7.5 && c.lx > v.x && c.lx < vx1 && c.ly > v.y && c.ly < vy1;
+      const want = show ? '' : 'none';
+      if (t.style.display !== want) t.style.display = want;
+    });
+  }
+
+  function cullRoads(vx1, vy1) {
+    const boxes = [];
+    const free = (x, y, w, h) => !boxes.some((b) => x < b[0] + b[2] && b[0] < x + w && y < b[1] + b[3] && b[1] < y + h);
+    const cx = v.x + v.w / 2, cy = v.y + v.h / 2;
+    const order = P.map((p, i) => i).filter((i) => lab[i]).sort((a, b) => (lab[b] === 2) - (lab[a] === 2) || P[a].g - P[b].g || P[b].a - P[a].a);
+    const shown = new Set();
+    for (const i of order) {
+      const p = P[i], t = texts[i];
+      const text = labText[i] || p.n;
+      const tw = text.length * 7.2 + 8, th = 18;
+      if (lab[i] !== 2 && p.a / u < tw * 2.2) continue;
+      const cand = spotsOf(i).filter(([x, y]) => x > v.x && x < vx1 && y > v.y && y < vy1)
+        .sort((a, b) => ((a[0] - cx) ** 2 + (a[1] - cy) ** 2) - ((b[0] - cx) ** 2 + (b[1] - cy) ** 2));
+      for (const [x, y] of cand) {
+        const sx = (x - v.x) / u - tw / 2, sy = (y - v.y) / u - th / 2;
+        if (lab[i] === 2 || free(sx, sy, tw, th)) {
+          boxes.push([sx, sy, tw, th]);
+          t.setAttribute('x', x); t.setAttribute('y', y);
+          shown.add(i);
+          break;
+        }
+      }
+    }
+    texts.forEach((t, i) => { const want = shown.has(i) ? '' : 'none'; if (t.style.display !== want) t.style.display = want; });
+    // towns: marked ones always; the rest biggest-first where there's room
+    for (let j = 0; j < towns.length; j++) {
+      const tn = towns[j], st = townSt[j];
+      const inView = tn.lx > v.x && tn.lx < vx1 && tn.ly > v.y && tn.ly < vy1;
+      let show = false;
+      if (inView && st !== -1 && (st === 1 || townMode === 'auto')) {
+        const sx = (tn.lx - v.x) / u, sy = (tn.ly - v.y) / u, w = tn.n.length * 6.3 + 10;
+        if (st === 1 || free(sx - w / 2, sy - 9, w, 18)) { boxes.push([sx - w / 2, sy - 9, w, 18]); show = true; }
+      }
+      const want = show ? '' : 'none';
+      if (ttexts[j].style.display !== want) { ttexts[j].style.display = want; tdots[j].style.display = want; }
+    }
+    ctexts.forEach((t, j) => {
+      const c = ctxLabeled[j];
+      const show = showCtx && Math.sqrt(c.a) / u > c.n.length * 7.5 && c.lx > v.x && c.lx < vx1 && c.ly > v.y && c.ly < vy1;
+      const want = show ? '' : 'none';
+      if (t.style.display !== want) t.style.display = want;
+    });
+  }
+
+  // ---- view control ----
+  function viewFor(bb, padPx) {
+    const pad = padPx == null ? 24 : padPx;
+    const bw = Math.max(bb[2] - bb[0], 1), bh = Math.max(bb[3] - bb[1], 1);
+    const uu = clamp(Math.max(bw / Math.max(cw - 2 * pad, 40), bh / Math.max(ch - 2 * pad, 40)), minU(), maxU());
+    const cx = (bb[0] + bb[2]) / 2, cy = (bb[1] + bb[3]) / 2;
+    return { x: cx - cw * uu / 2, y: cy - ch * uu / 2, w: cw * uu };
+  }
+  let anim = 0;
+  function setView(t, animate) {
+    cancelAnimationFrame(anim);
+    if (!animate) { v.x = t.x; v.y = t.y; v.w = t.w; apply(); return; }
+    const s = { x: v.x, y: v.y, w: v.w }, t0 = performance.now(), D = 320;
+    const step = (now) => {
+      const k = Math.min(1, (now - t0) / D), e = k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
+      v.x = s.x + (t.x - s.x) * e; v.y = s.y + (t.y - s.y) * e; v.w = s.w + (t.w - s.w) * e;
+      apply();
+      if (k < 1) anim = requestAnimationFrame(step);
+    };
+    anim = requestAnimationFrame(step);
+  }
+  let wanted = null; // last fit asked for, redone once the map knows its real size
+  function fit(bb, animate, padPx) { wanted = [bb, padPx, Date.now()]; setView(viewFor(bb, padPx), animate && cw > 1); }
+  function zoomAt(clientX, clientY, f) {
+    const r = host.getBoundingClientRect();
+    const mx = v.x + (clientX - r.left) * u, my = v.y + (clientY - r.top) * u;
+    const nu = clamp(u * f, minU(), maxU());
+    v.w = cw * nu; v.x = mx - (clientX - r.left) * nu; v.y = my - (clientY - r.top) * nu;
+    apply();
+  }
+  // Make sure place i is on screen and big enough to see.
+  function focus(i, minPx) {
+    const p = P[i], bb = p.bb;
+    const sw = (bb[2] - bb[0]) / u, sh = (bb[3] - bb[1]) / u;
+    const inside = bb[0] > v.x && bb[2] < v.x + v.w && bb[1] > v.y && bb[3] < v.y + v.h;
+    const need = minPx || 26;
+    if (inside && Math.max(sw, sh) >= need) return;
+    let t;
+    if (Math.max(sw, sh) < need) {
+      const side = Math.max(bb[2] - bb[0], bb[3] - bb[1]);
+      const uu = clamp(Math.min(u, side / need), minU(), maxU());
+      t = { x: (bb[0] + bb[2]) / 2 - cw * uu / 2, y: (bb[1] + bb[3]) / 2 - ch * uu / 2, w: cw * uu };
+    } else {
+      t = { x: (bb[0] + bb[2]) / 2 - v.w / 2, y: (bb[1] + bb[3]) / 2 - v.h / 2, w: v.w };
+    }
+    setView(t, true);
+  }
+
+  // ---- pointer input ----
+  const pts = new Map();
+  let gest = null;
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  if (!opt.static) {
+    svg.addEventListener('pointerdown', (e) => {
+      if (e.button > 0) return;
+      try { svg.setPointerCapture(e.pointerId); } catch (er) { /* ignore */ }
+      pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (pts.size === 1) gest = { type: 'pan', sx: e.clientX, sy: e.clientY, vx: v.x, vy: v.y, moved: false };
+      else if (pts.size === 2) {
+        const [a, b] = Array.from(pts.values());
+        const r = host.getBoundingClientRect();
+        const mx = (a.x + b.x) / 2 - r.left, my = (a.y + b.y) / 2 - r.top;
+        gest = { type: 'pinch', d0: dist(a, b), u0: u, wx: v.x + mx * u, wy: v.y + my * u, moved: true };
+      }
+    });
+    svg.addEventListener('pointermove', (e) => {
+      if (!pts.has(e.pointerId)) {
+        if (opt.onHover && e.pointerType === 'mouse') opt.onHover(hitAt(e.clientX, e.clientY));
+        return;
+      }
+      pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (!gest) return;
+      if (gest.type === 'pan') {
+        const dx = e.clientX - gest.sx, dy = e.clientY - gest.sy;
+        if (!gest.moved && Math.hypot(dx, dy) > 7) gest.moved = true;
+        if (gest.moved) { v.x = gest.vx - dx * u; v.y = gest.vy - dy * u; apply(); }
+      } else if (gest.type === 'pinch' && pts.size >= 2) {
+        const [a, b] = Array.from(pts.values());
+        const r = host.getBoundingClientRect();
+        const mx = (a.x + b.x) / 2 - r.left, my = (a.y + b.y) / 2 - r.top;
+        const nu = clamp(gest.u0 * gest.d0 / Math.max(dist(a, b), 1), minU(), maxU());
+        v.w = cw * nu; v.x = gest.wx - mx * nu; v.y = gest.wy - my * nu;
+        apply();
+      }
+    });
+    const up = (e) => {
+      if (!pts.has(e.pointerId)) return;
+      pts.delete(e.pointerId);
+      if (gest && gest.type === 'pan' && !gest.moved && pts.size === 0 && e.type === 'pointerup') {
+        const i = hitAt(e.clientX, e.clientY);
+        const hr = host.getBoundingClientRect();
+        lastTap = { x: e.clientX - hr.left, y: e.clientY - hr.top, t: Date.now() };
+        if (opt.onTap) opt.onTap(i, e);
+      }
+      if (pts.size === 1) {
+        const [a] = Array.from(pts.values());
+        gest = { type: 'pan', sx: a.x, sy: a.y, vx: v.x, vy: v.y, moved: true };
+      } else if (!pts.size) gest = null;
+    };
+    svg.addEventListener('pointerup', up);
+    svg.addEventListener('pointercancel', up);
+    svg.addEventListener('wheel', (e) => { e.preventDefault(); zoomAt(e.clientX, e.clientY, Math.exp(e.deltaY * (e.deltaMode ? 0.05 : 0.0016))); }, { passive: false });
+  }
+  if (opt.buttons !== false && !opt.static) {
+    const zb = document.createElement('div');
+    zb.className = 'zoombtns';
+    zb.innerHTML = '<button data-z="in" aria-label="Zoom in">+</button><button data-z="out" aria-label="Zoom out">−</button><button data-z="fit" aria-label="Show all">⤢</button>';
+    zb.addEventListener('click', (e) => {
+      const b = e.target.closest('button');
+      if (!b) return;
+      const r = host.getBoundingClientRect();
+      if (b.dataset.z === 'fit') fit(home, true);
+      else zoomAt(r.left + cw / 2, r.top + ch / 2, b.dataset.z === 'in' ? 0.6 : 1.6);
+    });
+    zb.addEventListener('pointerdown', (e) => e.stopPropagation());
+    host.appendChild(zb);
+  }
+
+  // Place under a screen point; small places (markers) can be hit from a little way off.
+  function hitAt(x, y) {
+    const el = document.elementFromPoint(x, y);
+    if (el && el.dataset && el.dataset.i != null && svg.contains(el)) return +el.dataset.i;
+    const r = host.getBoundingClientRect();
+    const mx = v.x + (x - r.left) * u, my = v.y + (y - r.top) * u;
+    let best = -1, bd = (18 * u) ** 2;
+    for (const k in marks) { const p = P[k]; const d = (p.lx - mx) ** 2 + (p.ly - my) ** 2; if (d < bd) { bd = d; best = +k; } }
+    return best;
+  }
+  function toScreen(x, y) { return { x: (x - v.x) / u, y: (y - v.y) / u }; }
+
+  const ro = new ResizeObserver(() => {
+    const ou = u, cx = v.x + v.w / 2, cy = v.y + v.h / 2;
+    const first = cw === 1;
+    measure();
+    if (first) { const w = wanted || [home]; fit(w[0], false, w[1]); return; }
+    // the panel under a game often changes height right after a zoom: redo that zoom
+    if (wanted && Date.now() - wanted[2] < 1500) { fit(wanted[0], false, wanted[1]); return; }
+    v.w = cw * ou; v.x = cx - v.w / 2; v.y = cy - ch * ou / 2;
+    apply();
+  });
+  ro.observe(host);
+  measure();
+  fit(home, false);
+
+  const pops = [];
+  let lastTap = null;
+  const api = {
+    svg, pack,
+    el: (i) => paths[i],
+    cls(i, c, on) {
+      const f = on === false ? 'remove' : 'add';
+      paths[i].classList[f](c);
+      if (marks[i]) marks[i].classList[f](c);
+    },
+    has: (i, c) => paths[i].classList.contains(c),
+    clearCls(list) { const cs = list.split(' '); paths.forEach((p, i) => { p.classList.remove(...cs); if (marks[i]) marks[i].classList.remove(...cs); }); },
+    fill(i, color) { paths[i].style[ROADS ? 'stroke' : 'fill'] = color || ''; if (marks[i]) marks[i].style.fill = color || ''; },
+    // towns on road maps: st 1 = always named, -1 = never, 0 = when there's room; cls marks the dot (start / end)
+    town(j, st, cls) {
+      townSt[j] = st;
+      tdots[j].setAttribute('class', cls ? 'big ' + cls : '');
+      ttexts[j].setAttribute('class', cls ? 'f' : '');
+      tdots[j].setAttribute('r', u * (cls ? 7 : 3.2));
+      scheduleCull();
+    },
+    townsAuto(on) { townMode = on ? 'auto' : 'none'; scheduleCull(); },
+    townPop(j, text, kind, ms) {
+      const t = towns[j], s = toScreen(t.lx, t.ly);
+      const d = document.createElement('div');
+      d.className = 'pop ' + (kind || '');
+      d.textContent = text;
+      d.style.left = clamp(s.x, 50, cw - 50) + 'px';
+      d.style.top = clamp(s.y, 34, ch) + 'px';
+      host.appendChild(d);
+      setTimeout(() => d.remove(), ms || 1500);
+    },
+    hideRoads(on) { svg.classList.toggle('hideroads', !!on); },
+    label(i, st, text) {
+      lab[i] = st;
+      const want = text || null;
+      if (labText[i] !== want) { labText[i] = want; texts[i].textContent = want || P[i].n; }
+      const c = st === 2 ? 'f' : st === 3 ? 'dim' : '';
+      if (texts[i].getAttribute('class') !== c) texts[i].setAttribute('class', c);
+      scheduleCull();
+    },
+    labelAll(st) { for (let i = 0; i < P.length; i++) api.label(i, st); },
+    ctxLabels(on) { showCtx = on; scheduleCull(); },
+    borders(on) { svg.classList.toggle('noborders', !on); $('.outline', svg).style.display = on ? 'none' : ''; },
+    groupLines(on) { svg.classList.toggle('nogroups', !on); },
+    flash(i, c, ms) { api.cls(i, c); setTimeout(() => api.cls(i, c, false), ms || 650); },
+    pop(i, text, kind, ms) {
+      const p = P[i];
+      let s = toScreen(p.lx, p.ly);
+      if (ROADS) {
+        // at the tap if it was just now, else the label spot of this road nearest the middle of the view
+        if (lastTap && Date.now() - lastTap.t < 400) s = lastTap;
+        else {
+          const cx = v.x + v.w / 2, cy = v.y + v.h / 2;
+          const best = spotsOf(i).slice().sort((a, b) => ((a[0] - cx) ** 2 + (a[1] - cy) ** 2) - ((b[0] - cx) ** 2 + (b[1] - cy) ** 2))[0];
+          s = toScreen(best[0], best[1]);
+        }
+      }
+      const d = document.createElement('div');
+      d.className = 'pop ' + (kind || '');
+      d.textContent = text;
+      d.style.left = clamp(s.x, 50, cw - 50) + 'px';
+      d.style.top = clamp(s.y, 34, ch) + 'px';
+      host.appendChild(d);
+      pops.push(d);
+      setTimeout(() => d.remove(), ms || 1500);
+    },
+    fit, focus, setView, hitAt,
+    setHome(bb) { home = bb; },
+    fitHome(animate) { fit(home, animate); },
+    bboxOf(idxs) {
+      let b = [Infinity, Infinity, -Infinity, -Infinity];
+      idxs.forEach((i) => { const q = P[i].bb; b = [Math.min(b[0], q[0]), Math.min(b[1], q[1]), Math.max(b[2], q[2]), Math.max(b[3], q[3])]; });
+      return b[0] === Infinity ? [0, 0, pack.w, pack.h] : b;
+    },
+    destroy() { ro.disconnect(); cancelAnimationFrame(anim); outer.innerHTML = ''; },
+  };
+  return api;
+}
+</script>

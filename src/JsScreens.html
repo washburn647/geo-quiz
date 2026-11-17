@@ -1,0 +1,332 @@
+<script>
+// ---------- screens: home, progress, map hub ----------
+const app = () => $('#app');
+let CUR = '';
+let HUBMAP = null;
+function currentHash() { return CUR; }
+
+function route(h) {
+  h = (h || '').replace(/^#/, '');
+  CUR = h;
+  closeGame();
+  $$('.modal').forEach((m) => m.remove());
+  if (HUBMAP) { HUBMAP.destroy(); HUBMAP = null; }
+  const parts = h.split('/');
+  window.scrollTo(0, 0);
+  if (parts[0] === 'm' && parts[1] && S.catalog.packs[parts[1]]) renderHub(parts[1], parts[2] || 'play');
+  else if (parts[0] === 'progress') renderProgress();
+  else renderHome();
+}
+
+function masteryBar(id) {
+  const m = mastery(id);
+  const n = packInfo(id).count || 1;
+  const knownW = m.known / n * 100, seenW = Math.max(0, (m.seen - m.known) / n * 100);
+  return '<div class="bar"><i style="width:' + knownW + '%;background:var(--m5)"></i><i style="width:' + seenW + '%;background:var(--m3)"></i></div>';
+}
+function mapCard(id, label) {
+  const info = packInfo(id), m = mastery(id);
+  const sub = info.count + ' ' + info.nouns + (m.plays ? ' · ' + pct(m.pct) + ' mastered · ' + fmtAgo(m.last) : '');
+  return '<a class="mapcard" href="#m/' + id + '"><div class="t">' + esc(label || fullTitle(id)) + '</div><div class="s">' + esc(sub) + '</div>' + masteryBar(id) + '</a>';
+}
+
+function renderHome() {
+  const streak = dayStreak();
+  const t = S.progress.totals;
+  const pins = (S.settings.pins || []).filter((id) => S.catalog.packs[id]);
+  const recent = Object.keys(S.progress.maps).filter((id) => S.catalog.packs[id] && S.progress.maps[id].plays && !pins.includes(id))
+    .sort((a, b) => S.progress.maps[b].last - S.progress.maps[a].last).slice(0, 6);
+  let html = '<div class="page"><div class="top"><h1>Geography Quiz<small>' + (streak ? '🔥 ' + streak + '-day streak · ' : '') + t.plays + ' games played</small></h1>'
+    + '<div class="tabs"><button class="on">Maps</button><button onclick="go(\'progress\')">Progress</button></div></div>'
+    + '<input class="search" id="q" placeholder="Search maps — a country, state or continent" autocomplete="off">'
+    + '<div id="results"></div><div id="browse">';
+  if (pins.length) html += '<h2>Pinned</h2><div class="maplist">' + pins.map((id) => mapCard(id)).join('') + '</div>';
+  if (recent.length) html += '<h2>Keep going</h2><div class="maplist">' + recent.map((id) => mapCard(id)).join('') + '</div>';
+  html += '<h2>All maps</h2>';
+  S.catalog.tree.forEach((g, gi) => {
+    html += '<div class="group"><button data-g="' + gi + '">' + esc(g.title) + '<span class="muted">' + (g.items ? g.items.length : g.states.length) + ' ›</span></button><div class="hide" id="g' + gi + '">';
+    if (g.items) html += '<div class="maplist">' + g.items.map((it) => mapCard(it.id, it.label)).join('') + '</div>';
+    else html += '<div class="statesgrid">' + g.states.map((st, si) => '<button data-st="' + gi + ':' + si + '"><b>' + esc(st.title) + '</b><br><span class="muted" style="font-size:12.5px">' + st.items.map((it) => esc(it.label)).join(' · ') + '</span></button>').join('') + '</div><div id="st' + gi + '"></div>';
+    html += '</div></div>';
+  });
+  html += '</div></div>';
+  app().innerHTML = html;
+  const open = store.get('openGroups', []);
+  open.forEach((gi) => { const el = $('#g' + gi); if (el) el.classList.remove('hide'); });
+  app().onclick = homeClick;
+  $('#q').addEventListener('input', (e) => {
+    const k = norm(e.target.value);
+    $('#browse').classList.toggle('hide', !!k);
+    if (!k) { $('#results').innerHTML = ''; return; }
+    const hits = Object.keys(S.catalog.packs).filter((id) => norm(fullTitle(id) + ' ' + id.replace(/-/g, ' ')).includes(k)).slice(0, 40);
+    $('#results').innerHTML = '<h2>' + hits.length + ' maps</h2><div class="maplist">' + hits.map((id) => mapCard(id)).join('') + '</div>';
+  });
+}
+function homeClick(e) {
+  const g = e.target.closest('[data-g]'), st = e.target.closest('[data-st]');
+  if (g) {
+    const el = $('#g' + g.dataset.g);
+    el.classList.toggle('hide');
+    const open = $$('.group > div').map((d, i) => d.classList.contains('hide') ? -1 : i).filter((i) => i >= 0);
+    store.set('openGroups', open);
+  }
+  if (st) {
+    const [gi, si] = st.dataset.st.split(':').map(Number);
+    const s = S.catalog.tree[gi].states[si];
+    if (s.items.length === 1) { go('m/' + s.items[0].id); return; }
+    $('#st' + gi).innerHTML = '<h2>' + esc(s.title) + '</h2><div class="maplist">' + s.items.map((it) => mapCard(it.id, s.title + ' — ' + it.label.toLowerCase())).join('') + '</div>';
+    $('#st' + gi).scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+}
+
+function renderProgress() {
+  const t = S.progress.totals, streak = dayStreak();
+  const ids = Object.keys(S.progress.maps).filter((id) => S.catalog.packs[id]).sort((a, b) => S.progress.maps[b].last - S.progress.maps[a].last);
+  const known = ids.reduce((s, id) => s + S.progress.maps[id].known, 0);
+  // last 26 weeks of play, Sunday-first columns
+  const days = S.progress.days || {};
+  const end = new Date(); const start = new Date(); start.setDate(end.getDate() - 7 * 26 - end.getDay());
+  let heat = '';
+  for (const d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    const n = days[d.toLocaleDateString('en-CA')] || 0;
+    heat += '<i title="' + d.toDateString() + ': ' + n + ' games" style="' + (n ? 'background:var(--m' + Math.min(5, 1 + n) + ')' : '') + '"></i>';
+  }
+  let html = '<div class="page"><div class="top"><h1>Progress<small>Everything is also in the spreadsheet’s Runs and Places tabs</small></h1>'
+    + '<div class="tabs"><button onclick="go(\'\')">Maps</button><button class="on">Progress</button></div></div>'
+    + '<div class="stats"><div class="stat"><b>' + streak + '</b><span>day streak</span></div><div class="stat"><b>' + t.plays + '</b><span>games</span></div>'
+    + '<div class="stat"><b>' + fmtSecs(t.secs) + '</b><span>time played</span></div><div class="stat"><b>' + known + '</b><span>places known (level 3+)</span></div>'
+    + '<div class="stat"><b>' + ids.length + '</b><span>maps played</span></div></div>'
+    + '<h2>Days played</h2><div class="card"><div class="heat">' + heat + '</div></div>';
+  if (ids.length) {
+    html += '<h2>Maps</h2><div class="card"><table class="t"><tr><th>Map</th><th class="c">Mastered</th><th class="c">Known</th><th class="c">Games</th><th>Last</th></tr>'
+      + ids.map((id) => { const m = mastery(id); return '<tr><td><a href="#m/' + id + '">' + esc(fullTitle(id)) + '</a></td><td class="c">' + pct(m.pct) + '</td><td class="c">' + m.known + '/' + packInfo(id).count + '</td><td class="c">' + m.plays + '</td><td class="muted">' + fmtAgo(m.last) + '</td></tr>'; }).join('')
+      + '</table></div>';
+  }
+  if (S.progress.recent.length) {
+    html += '<h2>Recent games</h2><div class="card"><table class="t"><tr><th>When</th><th>Map</th><th>Game</th><th class="c">Score</th></tr>'
+      + S.progress.recent.map((r) => '<tr><td class="muted">' + fmtAgo(r[0]) + '</td><td><a href="#m/' + r[1] + '">' + esc(packInfo(r[1]).title) + '</a> <span class="muted">' + esc(r[6] && r[6] !== 'All' ? r[6] : '') + '</span></td><td>' + esc(r[2]) + ' <span class="muted">' + esc(r[3]) + '</span></td><td class="c">' + pct(r[4]) + '</td></tr>').join('')
+      + '</table></div>';
+  } else html += '<p class="muted" style="margin-top:20px">Play a game and your progress shows up here.</p>';
+  app().innerHTML = html + '</div>';
+  app().onclick = null;
+}
+
+// ---------- map hub ----------
+function scopeOptions(pack, prog) {
+  const all = pack.places.map((p) => p.i);
+  const seen = all.filter((i) => lvlOf(prog, pack.places[i].n) >= 0);
+  const weak = seen.filter((i) => lvlOf(prog, pack.places[i].n) < 3).sort((a, b) => {
+    const ra = prog.places[pack.places[a].n], rb = prog.places[pack.places[b].n];
+    return ra[0] - rb[0] || rb[3] / rb[1] - ra[3] / ra[1];
+  }).slice(0, 15);
+  const due = seen.filter((i) => isDue(prog, pack.places[i].n));
+  const fresh = all.filter((i) => lvlOf(prog, pack.places[i].n) < 0);
+  return { all, weak, due, fresh };
+}
+function scopeFor(pack, prog, sel) {
+  const o = scopeOptions(pack, prog);
+  if (sel.type === 'weak') return { label: 'Weak spots', idxs: o.weak };
+  if (sel.type === 'due') return { label: 'Due for review', idxs: o.due };
+  if (sel.type === 'new') return { label: 'Never asked', idxs: o.fresh };
+  if (sel.type === 'groups' && sel.g && sel.g.length) {
+    const gs = sel.g.filter((g) => g < pack.groups.length);
+    if (gs.length) {
+      const idxs = [].concat(...gs.map((g) => pack.groupMembers[g]));
+      const label = gs.length <= 2 ? gs.map((g) => pack.groups[g]).join(' + ') : gs.length + ' ' + pack.groupNoun.toLowerCase() + 's';
+      return { label, idxs };
+    }
+  }
+  return { label: 'All', idxs: o.all };
+}
+const LVL_COLORS = ['var(--m1)', 'var(--m1)', 'var(--m2)', 'var(--m3)', 'var(--m4)', 'var(--m5)'];
+
+async function renderHub(id, tab) {
+  const info = packInfo(id);
+  app().innerHTML = '<div class="page"><div class="loading"><div><div class="spin"></div>Loading ' + esc(fullTitle(id)) + '…</div></div></div>';
+  let pack, prog;
+  try { [pack, prog] = await Promise.all([loadPack(id), loadProgress(id)]); } catch (e) {
+    app().innerHTML = '<div class="page"><p>Couldn’t load this map (' + esc(e.message || e) + ').</p><a href="#">Back</a></div>';
+    return;
+  }
+  if (CUR.split('/')[1] !== id) return;
+  const setup = Object.assign({ mode: 'find', level: 0, scope: { type: 'all' } }, store.get('setup:' + id, {}));
+  // Links from the dashboard: #m/<id>/play/<game>/<level>/<scope> picks that game and starts it.
+  // The extra parts are dropped right away so finishing the game comes back here, not to a fresh start.
+  let autostart = false;
+  const pre = CUR.split('/').slice(3).map((s) => decodeURIComponent(s));
+  if (pre.length) {
+    const md = MODES.find((x) => x.n === pre[0] || x.id === pre[0]);
+    if (md) setup.mode = md.id;
+    if (LEVELS.indexOf(pre[1]) >= 0) setup.level = LEVELS.indexOf(pre[1]);
+    const sp = { 'All': 'all', 'Weak spots': 'weak', 'Due for review': 'due', 'Never asked': 'new' }[pre[2] || 'All'];
+    const gs = sp ? [] : (pre[2] || '').split(' + ').map((g) => pack.groups.indexOf(g));
+    if (sp) setup.scope = { type: sp };
+    const known = gs.length > 0 && gs.every((g) => g >= 0);
+    if (known) setup.scope = { type: 'groups', g: gs };
+    autostart = !!(md && (sp || known));
+    CUR = 'm/' + id + '/play';
+    if (gsh()) google.script.history.replace(null, null, CUR); else history.replaceState(null, '', '#' + CUR);
+  }
+  const pinned = (S.settings.pins || []).includes(id);
+  const m = mastery(id);
+  const html = '<div class="page"><div class="top"><a class="iconbtn" href="#" aria-label="Back" style="text-decoration:none">‹</a><h1>' + esc(info.title) + '<small>' + info.count + ' ' + esc(info.nouns) + '</small></h1>'
+    + '<button class="iconbtn' + (pinned ? ' on' : '') + '" id="pin" aria-label="Pin">' + (pinned ? '★' : '☆') + '</button></div>'
+    + '<div class="tabs" style="margin-bottom:12px;display:inline-flex"><button data-tab="play" class="' + (tab === 'play' ? 'on' : '') + '">Play</button><button data-tab="stats" class="' + (tab === 'stats' ? 'on' : '') + '">Stats</button></div>'
+    + '<div class="hubgrid"><div><div class="minimap" id="mini"></div><div class="legend"><span><i style="background:var(--m0)"></i>Not asked yet</span><span><i style="background:var(--m1)"></i>Learning</span><span><i style="background:var(--m3)"></i>Getting there</span><span><i style="background:var(--m5)"></i>Mastered</span>'
+    + '<span style="margin-left:auto">' + pct(m.pct) + ' mastered · ' + m.known + '/' + info.count + ' known</span></div></div>'
+    + '<div id="hubside"></div></div><div id="hubbelow"></div></div>';
+  app().innerHTML = html;
+  app().onclick = null;
+  HUBMAP = MapView($('#mini'), pack, {
+    onTap: (i) => {
+      if (i < 0) return;
+      const r = prog.places[pack.places[i].n];
+      HUBMAP.pop(i, pack.places[i].n + (r ? ' · level ' + Math.floor(r[0]) + ' · ' + r[2] + '/' + r[1] + ' right' : ' · not asked yet'), '', 2200);
+    },
+  });
+  pack.places.forEach((p) => { const l = lvlOf(prog, p.n); HUBMAP.fill(p.i, l < 0 ? 'var(--m0)' : LVL_COLORS[Math.floor(l)]); });
+  HUBMAP.ctxLabels(true);
+  $('#pin').addEventListener('click', (e) => {
+    const pins = S.settings.pins || (S.settings.pins = []);
+    const k = pins.indexOf(id);
+    if (k >= 0) pins.splice(k, 1); else pins.unshift(id);
+    e.target.textContent = k >= 0 ? '☆' : '★';
+    e.target.classList.toggle('on', k < 0);
+    saveSettings();
+  });
+  $$('[data-tab]').forEach((b) => b.addEventListener('click', () => go('m/' + id + '/' + b.dataset.tab, true)));
+  if (tab === 'stats') renderStats(id, pack, prog);
+  else {
+    renderSetup(id, pack, prog, setup);
+    const start = $('#start');
+    if (autostart && start && !start.disabled) start.click();
+  }
+}
+
+function renderSetup(id, pack, prog, setup) {
+  const side = $('#hubside');
+  const o = scopeOptions(pack, prog);
+  const kind = pack.kind || 'area';
+  const modesHere = MODES.filter((md) => !md.kinds || md.kinds.includes(kind));
+  if (!modesHere.some((md) => md.id === setup.mode)) setup.mode = 'find';
+  const draw = () => {
+    store.set('setup:' + id, setup);
+    const sc = scopeFor(pack, prog, setup.scope);
+    const mb = S.progress.maps[id] ? S.progress.maps[id].best : {};
+    const modeCards = modesHere.map((md) => {
+      const b = mb[md.n + '|' + LEVELS[setup.level] + '|' + sc.label];
+      const best = b && md.id !== 'study' ? (md.id === 'blitz' || md.id === 'all' ? b[0] : md.id === 'trip' ? b[0] + '%' : pct(b[2])) : '';
+      return '<button class="mode' + (setup.mode === md.id ? ' on' : '') + '" data-mode="' + md.id + '"><span class="e">' + md.e + '</span><span class="n">' + esc(md.n) + '</span><span class="d">' + esc(md.d) + '</span>' + (best ? '<span class="best">★ ' + best + '</span>' : '') + '</button>';
+    }).join('');
+    const isStudy = setup.mode === 'study';
+    const groupChips = pack.groups.map((g, gi) => '<button class="chip' + (setup.scope.type === 'groups' && (setup.scope.g || []).includes(gi) ? ' on' : '') + '" data-grp="' + gi + '">' + esc(g) + ' <small>' + pack.groupMembers[gi].length + '</small></button>').join('');
+    const special = [['all', 'All', o.all.length], ['weak', 'Weak spots', o.weak.length], ['due', 'Due for review', o.due.length], ['new', 'Never asked', o.fresh.length]];
+    side.innerHTML = '<div class="setup">'
+      + '<div class="modes">' + modeCards + '</div>'
+      + (isStudy ? '' : '<div><div class="levels">' + LEVELS.map((L, li) => '<button data-lvl="' + li + '" class="' + (setup.level === li ? 'on' : '') + '">' + L + '</button>').join('') + '</div><div class="leveldesc">' + esc(LEVEL_DESC[setup.mode][setup.level]) + '</div></div>')
+      + '<div><b style="font-size:13px" class="muted">WHICH ' + esc(pack.nouns.toUpperCase()) + '</b><div class="chipline" style="margin-top:6px">'
+      + special.map(([k, l, n]) => '<button class="chip' + (setup.scope.type === k ? ' on' : '') + '" data-scope="' + k + '"' + (n || k === 'all' ? '' : ' disabled style="opacity:.45"') + '>' + l + ' <small>' + n + '</small></button>').join('')
+      + '</div>' + (pack.groups.length ? '<div class="muted" style="font-size:12.5px;margin:10px 0 5px">By ' + esc(pack.groupNoun.toLowerCase()) + ' (tap several to combine)</div><div class="chipline">' + groupChips + '</div>' : '') + '</div>'
+      + '<button class="btn primary big" id="start"' + (sc.idxs.length ? '' : ' disabled') + '>' + MODE[setup.mode].e + ' ' + (isStudy ? 'Study' : 'Play') + ' · ' + esc(sc.label === 'All' ? 'all ' + sc.idxs.length : sc.label + ' (' + sc.idxs.length + ')') + '</button>'
+      + '</div>';
+    HUBMAP.clearCls('sel');
+    if (sc.label !== 'All') sc.idxs.forEach((i) => HUBMAP.cls(i, 'sel'));
+    HUBMAP.setHome(HUBMAP.bboxOf(sc.idxs.length ? sc.idxs : o.all));
+    HUBMAP.fitHome(true);
+  };
+  side.onclick = (e) => {
+    const md = e.target.closest('[data-mode]'), lv = e.target.closest('[data-lvl]'), sc = e.target.closest('[data-scope]'), gr = e.target.closest('[data-grp]');
+    if (md) setup.mode = md.dataset.mode;
+    if (lv) setup.level = +lv.dataset.lvl;
+    if (sc && !sc.disabled) setup.scope = { type: sc.dataset.scope };
+    if (gr) {
+      const g = +gr.dataset.grp;
+      const cur = setup.scope.type === 'groups' ? (setup.scope.g || []) : [];
+      const next = cur.includes(g) ? cur.filter((x) => x !== g) : cur.concat(g);
+      setup.scope = next.length ? { type: 'groups', g: next } : { type: 'all' };
+    }
+    if (e.target.closest('#start')) {
+      startGame({ id, mode: setup.mode, level: setup.mode === 'study' ? 0 : setup.level, scope: scopeFor(pack, prog, setup.scope) });
+      return;
+    }
+    if (md || lv || sc || gr) draw();
+  };
+  draw();
+}
+
+function renderStats(id, pack, prog) {
+  const info = packInfo(id), m = mastery(id);
+  const runs = prog.runs || [];
+  const side = $('#hubside'), below = $('#hubbelow');
+  side.innerHTML = '<div class="stats"><div class="stat"><b>' + pct(m.pct) + '</b><span>mastered</span></div><div class="stat"><b>' + m.known + '<small style="font-size:14px">/' + info.count + '</small></b><span>known (level 3+)</span></div>'
+    + '<div class="stat"><b>' + runs.length + '</b><span>games</span></div><div class="stat"><b>' + fmtSecs(runs.reduce((s, r) => s + r[7], 0)) + '</b><span>time played</span></div></div>'
+    + '<h2>Accuracy, last ' + Math.min(40, runs.length) + ' games</h2><div class="card">' + chart(runs.slice(-40)) + '</div>';
+  let html = '';
+  // best by game and level
+  const best = {};
+  runs.forEach((r) => {
+    const k = r[1] + '|' + r[2];
+    if (!best[k] || r[8] > best[k][8] || (r[8] === best[k][8] && r[7] < best[k][7])) best[k] = r;
+  });
+  const played = MODES.filter((md) => LEVELS.some((L) => best[md.n + '|' + L]));
+  if (played.length) {
+    html += '<h2>Best results</h2><div class="card" style="overflow-x:auto"><table class="t"><tr><th>Game</th>' + LEVELS.map((L) => '<th class="c">' + L + '</th>').join('') + '</tr>'
+      + played.map((md) => '<tr><td>' + md.e + ' ' + esc(md.n) + '</td>' + LEVELS.map((L) => {
+        const r = best[md.n + '|' + L];
+        if (!r) return '<td class="c muted">–</td>';
+        const main = md.id === 'blitz' ? r[8] + ' found' : md.id === 'all' ? r[8] + '/' + r[4] : md.id === 'trip' ? r[8] + '%' : pct(r[6]);
+        return '<td class="c"><b>' + main + '</b><br><span class="muted" style="font-size:11.5px">' + fmtSecs(r[7]) + (r[3] && r[3] !== 'All' ? ' · ' + esc(r[3]) : '') + '</span></td>';
+      }).join('') + '</tr>').join('') + '</table></div>';
+  }
+  if (pack.groups.length) {
+    html += '<h2>By ' + esc(pack.groupNoun.toLowerCase()) + '</h2><div class="card">' + pack.groups.map((g, gi) => {
+      const mem = pack.groupMembers[gi];
+      const lv = mem.reduce((s, i) => s + Math.max(0, lvlOf(prog, pack.places[i].n)), 0) / (5 * mem.length);
+      return '<div class="gbar"><span>' + esc(g) + '</span><div class="bar"><i style="width:' + lv * 100 + '%;background:var(--m5)"></i></div><span class="muted">' + pct(lv) + '</span></div>';
+    }).join('') + '</div>';
+  }
+  const tricky = Object.entries(prog.places).filter(([, r]) => r[3] > 0).sort((a, b) => (b[1][3] / b[1][1]) - (a[1][3] / a[1][1]) || b[1][3] - a[1][3]).slice(0, 12);
+  if (tricky.length) {
+    html += '<h2>Trickiest</h2><div class="card">' + tricky.map(([n, r]) => '<div class="trick"><span>' + esc(n) + '</span><span class="muted">' + r[2] + ' of ' + r[1] + ' right · level ' + Math.floor(r[0]) + '</span></div>').join('')
+      + '<div class="panelrow"><button class="btn primary" id="drill">Practice these in Pinpoint</button></div></div>';
+  }
+  if (runs.length) {
+    html += '<h2>History</h2><div class="card" style="overflow-x:auto"><table class="t"><tr><th>When</th><th>Game</th><th>Which</th><th class="c">Score</th><th class="c">Time</th></tr>'
+      + runs.slice(-25).reverse().map((r) => '<tr><td class="muted">' + fmtAgo(r[0]) + '</td><td>' + esc(r[1]) + ' <span class="muted">' + esc(r[2]) + '</span></td><td>' + esc(r[3]) + '</td><td class="c">' + (r[1] === 'Blitz' ? r[8] : r[1] === 'Road Trip' ? r[8] + '%' : r[5] + '/' + r[4]) + '</td><td class="c">' + fmtSecs(r[7]) + '</td></tr>').join('')
+      + '</table></div>';
+    html += '<p style="margin-top:22px"><button class="btn" id="reset">Reset this map’s progress…</button></p>';
+  } else html += '<p class="muted" style="margin-top:20px">No games on this map yet.</p>';
+  below.innerHTML = html;
+  const drill = $('#drill');
+  if (drill) drill.addEventListener('click', () => startGame({ id, mode: 'find', level: 2, scope: { label: 'Trickiest', idxs: tricky.map(([n]) => pack.byName.get(n)).filter((i) => i != null) } }));
+  const reset = $('#reset');
+  if (reset) reset.addEventListener('click', () => {
+    if (reset.dataset.armed) {
+      reset.disabled = true;
+      reset.textContent = 'Resetting…';
+      api('resetMap', id).then((pr) => {
+        S.mapProg[id] = pr; store.set('prog:' + id, pr);
+        delete S.progress.maps[id];
+        api('getBoot').then((b) => { S.progress = b.progress; route(CUR); });
+      }).catch((e) => { toast('Couldn’t reset: ' + (e.message || e)); });
+      return;
+    }
+    reset.dataset.armed = '1';
+    reset.textContent = 'Tap again to erase every game and level for this map';
+    reset.style.color = 'var(--bad)';
+  });
+}
+
+function chart(runs) {
+  if (runs.length < 2) return '<p class="muted" style="margin:0">Play a couple of games to see a trend.</p>';
+  const W = 600, H = 150, pad = 22;
+  const x = (i) => pad + i * (W - 2 * pad) / (runs.length - 1), y = (a) => H - pad - a * (H - 2 * pad);
+  const pts = runs.map((r, i) => x(i).toFixed(1) + ',' + y(r[6]).toFixed(1)).join(' ');
+  const colors = Object.fromEntries(MODES.map((md, i) => [md.n, 'hsl(' + (i * 37 % 360) + ' 60% 50%)']));
+  return '<svg class="chart" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">'
+    + [0, 0.5, 1].map((a) => '<line x1="' + pad + '" x2="' + (W - pad) + '" y1="' + y(a) + '" y2="' + y(a) + '" stroke="var(--line)"/><text x="2" y="' + (y(a) + 4) + '" font-size="11" fill="var(--muted)">' + a * 100 + '</text>').join('')
+    + '<polyline points="' + pts + '" fill="none" stroke="var(--accent)" stroke-width="2" vector-effect="non-scaling-stroke"/>'
+    + runs.map((r, i) => '<circle cx="' + x(i) + '" cy="' + y(r[6]) + '" r="3.5" fill="' + (colors[r[1]] || 'var(--accent)') + '"><title>' + esc(r[1] + ' · ' + r[2] + ' · ' + pct(r[6]) + ' · ' + new Date(r[0]).toLocaleDateString()) + '</title></circle>').join('')
+    + '</svg>';
+}
+</script>

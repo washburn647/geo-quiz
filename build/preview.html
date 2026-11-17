@@ -1,0 +1,42 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Map pack preview</title>
+<style>
+  body { font: 13px system-ui; margin: 10px; background: #eef3f7; }
+  .card { display: inline-block; vertical-align: top; margin: 6px; background: #fff; padding: 6px; border-radius: 6px; }
+  svg { width: 100%; height: auto; background: #cfe3f2; }
+  path.p { stroke: #fff; stroke-width: 6; }
+  path.c { fill: #e7e2d8; stroke: #fff; stroke-width: 4; }
+  path.lk { fill: #cfe3f2; }
+  path.ln { fill: none; stroke: #333; stroke-width: 14; }
+  text { font-size: 70px; text-anchor: middle; dominant-baseline: middle; fill: #222; paint-order: stroke; stroke: #fff; stroke-width: 10px; }
+  text.c { fill: #888; font-style: italic; }
+</style>
+<div id="out"></div>
+<script>
+const ids = (new URLSearchParams(location.search).get('ids') || '').split(',').filter(Boolean);
+const big = ids.length === 1;
+const pal = ['#8fb996', '#e9c46a', '#f4a261', '#90a8d0', '#c49bbb', '#9ec1a3', '#e5989b', '#b5a886', '#a3c4bc', '#d4a373', '#9bb1ff', '#cdb4db', '#b8e0d2', '#ffd6a5'];
+(async () => {
+  let list = ids;
+  if (!list.length) list = Object.keys((await (await fetch('../maps/catalog.json')).json()).packs);
+  for (const id of list) {
+    const p = await (await fetch('../maps/' + id + '.json?t=' + Date.now())).json();
+    const d = document.createElement('div');
+    d.className = 'card';
+    d.style.width = big ? '96vw' : '330px';
+    if (p.kind === 'roads') {
+      const roads = p.places.map((q, i) => `<path d="${q.d}" fill="none" stroke="${q.g ? '#c0392b' : '#1a5fb4'}" stroke-width="${q.g ? 14 : 26}"><title>${q.n} | meets ${q.nb.map((j) => p.places[j].n).join(', ')}</title></path>`).join('');
+      const lab = big ? p.places.map((q) => `<text x="${q.lx}" y="${q.ly}">${q.n}</text>`).join('') : '';
+      d.style.width = big ? '96vw' : '330px';
+      d.innerHTML = `<b>${p.title} roads</b> ${p.places.length}: ${p.places.map((q) => q.n).join(', ')}<svg viewBox="0 0 ${p.w} ${p.h}">${p.ctx.map((c) => `<path class="c" d="${c.d}"/>`).join('')}<path d="${p.base}" fill="#f6f2e8" stroke="#ccc" stroke-width="4"/><path class="lk" d="${p.lakes}"/>${roads}${lab}</svg>`;
+      document.getElementById('out').appendChild(d);
+      continue;
+    }
+    const g = p.places.map((q, i) => `<path class="p" d="${q.d}" fill="${pal[(q.g ?? i) % pal.length]}"><title>${q.n} | nb ${q.nb.map((j) => p.places[j].n).join(', ')} | near ${q.nr.map((j) => p.places[j].n).join(', ')}</title></path>` + (q.m ? `<circle cx="${q.lx}" cy="${q.ly}" r="40" fill="red"/>` : '')).join('');
+    const lab = big ? p.places.map((q) => `<text x="${q.lx}" y="${q.ly}">${q.n}</text>`).join('') + p.ctx.filter((c) => c.n).map((c) => `<text class="c" x="${c.lx}" y="${c.ly}">${c.n}</text>`).join('') : '';
+    d.innerHTML = `<b>${p.title}</b> ${p.places.length} ${p.nouns} · ${p.groups.join(', ')}<svg viewBox="0 0 ${p.w} ${p.h}">${p.ctx.map((c) => `<path class="c" d="${c.d}"/>`).join('')}${g}<path class="lk" d="${p.lakes}"/><path class="ln" d="${p.lines}"/>${(p.frames || []).map((f) => `<rect x="${f[0]}" y="${f[1]}" width="${f[2]}" height="${f[3]}" fill="none" stroke="#666" stroke-width="10"/>`).join('')}${lab}</svg>`;
+    document.getElementById('out').appendChild(d);
+  }
+})();
+</script>

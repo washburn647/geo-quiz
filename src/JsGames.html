@@ -1,0 +1,915 @@
+<script>
+// ---------- games ----------
+const MODES = [
+  { id: 'study', e: '🔍', n: 'Study', d: 'Look around with names on. No score.' },
+  { id: 'drop', e: '🏷️', n: 'Label Drop', d: 'Drag the names onto the map.' },
+  { id: 'find', e: '📍', n: 'Pinpoint', d: 'Tap the place that’s named.' },
+  { id: 'type', e: '⌨️', n: 'Name It', d: 'Type the highlighted place’s name.' },
+  { id: 'wheel', e: '🎡', n: 'Name Wheel', d: 'Flip through names to the right one.' },
+  { id: 'all', e: '🧠', n: 'Name ’em All', d: 'Type every one you can remember.' },
+  { id: 'border', e: '🧭', n: 'Border Patrol', d: 'Pick out every neighbor.' },
+  { id: 'trip', e: '🚗', n: 'Road Trip', d: 'Pick the roads from one town to another.', kinds: ['roads'] },
+  { id: 'shape', e: '🧩', n: 'Shape Shifter', d: 'Name it from its outline alone.', kinds: ['area'] },
+  { id: 'blitz', e: '⚡', n: 'Blitz', d: 'Find all you can before time runs out.' },
+];
+const MODE = Object.fromEntries(MODES.map((m) => [m.id, m]));
+const FRACS = [0.25, 0.5, 1, 1];
+const LEVEL_DESC = {
+  study: ['', '', '', ''],
+  drop: ['A quarter of the names to place; the rest are already on the map.', 'Half the names to place; the rest are already on the map.', 'Every name. Placed names stay on the map to help.', 'Every name, and no names on the map, ever.'],
+  find: ['A quarter of the places; the rest are labeled. Wrong taps tell you what you hit.', 'Half the places; the rest are labeled. Wrong taps tell you what you hit.', 'Every place. Found ones get labeled.', 'Every place, no labels and no clues from wrong taps.'],
+  type: ['A quarter of the places, with the first letter and length shown. Small typos are fine.', 'Half the places, with the length shown and a hint button.', 'Every place, no hints. Small typos are fine.', 'Every place and no names on the map.'],
+  wheel: ['Pick from 3 names.', 'Pick from 5 names.', 'Pick from 8 names, every place.', 'Flip through the whole list, every place.'],
+  all: ['No clock, and the first letters are on the map.', 'No clock.', 'Against the clock.', 'Against the clock, with the borders hidden.'],
+  border: ['Highlighted, with the number of neighbors and only a few decoys.', 'Highlighted, with the number of neighbors.', 'Highlighted, more decoys, and you decide when you have them all.', 'Not highlighted: you have to know where it is.'],
+  trip: ['Tap the roads on the map; every road is labeled. Up to 3 roads per trip.', 'Tap the roads on the map; no road names until you pick them.', 'Choose the roads by name from a list; the map shows the roads, unnamed. Up to 4 roads.', 'Choose the roads by name; the roads stay hidden until you pick them.'],
+  shape: ['Pick from 4 names.', 'Pick from 6 names.', 'Type the name.', 'Type the name, and the shape is turned.'],
+  blitz: ['90 seconds.', '60 seconds.', '60 seconds; wrong taps cost 3 seconds.', '45 seconds, wrong taps cost 3 seconds, no labels.'],
+};
+
+let GAME = null;
+
+async function startGame(cfg) {
+  const pack = await loadPack(cfg.id);
+  const prog = await loadProgress(cfg.id);
+  closeGame();
+  const root = document.createElement('div');
+  root.className = 'game';
+  root.innerHTML = '<div class="hud"><button class="iconbtn" data-act="quit" aria-label="Quit">✕</button><div class="prompt"></div><div class="meter"></div></div>'
+    + '<div class="stage"><div class="host" style="position:absolute;inset:0"></div><div class="timerbar hide"><i></i></div><div class="feed"></div></div><div class="panel"></div>';
+  document.body.appendChild(root);
+  const G = makeGame(cfg, pack, prog, root);
+  GAME = G;
+  $('[data-act="quit"]', root).addEventListener('click', () => askQuit(G));
+  ({ study: modeStudy, drop: modeDrop, find: modeFind, type: modeType, wheel: modeWheel, all: modeAll, border: modeBorder, trip: modeTrip, shape: modeShape, blitz: modeBlitz })[cfg.mode](G);
+}
+
+function closeGame() {
+  if (!GAME) return;
+  GAME.over = true;
+  GAME.stop();
+  GAME.mv.destroy();
+  GAME.root.remove();
+  document.removeEventListener('keydown', GAME.keys);
+  GAME = null;
+}
+
+function makeGame(cfg, pack, prog, root) {
+  const G = {
+    cfg, pack, prog, root, P: pack.places, lvl: cfg.level, mode: MODE[cfg.mode], noun: pack.noun, nouns: pack.nouns,
+    scope: cfg.scope.idxs, inScope: new Set(cfg.scope.idxs), results: [], missed: [], t0: Date.now(), over: false,
+    prompt: $('.prompt', root), meter: $('.meter', root), panel: $('.panel', root), stage: $('.stage', root), feed: $('.feed', root),
+    timers: [], ivs: [], keys: null, onTap: null,
+  };
+  G.mv = MapView($('.host', root), pack, {
+    onTap: (i, e) => {
+      if (G.looking) { if (i >= 0) G.mv.pop(i, G.P[i].n, '', 1400); return; }
+      if (!G.over && G.onTap) G.onTap(i, e);
+    },
+  });
+  G.home = G.mv.bboxOf(G.scope);
+  G.mv.setHome(G.home);
+  G.mv.fitHome(false);
+  if (G.scope.length < G.P.length) G.P.forEach((p) => { if (!G.inScope.has(p.i)) G.mv.cls(p.i, 'out'); });
+  G.setPrompt = (h) => { G.prompt.innerHTML = h; };
+  G.setMeter = (h) => { G.meter.innerHTML = h; };
+  G.after = (ms, fn) => { G.timers.push(setTimeout(() => { if (!G.over) fn(); }, ms)); };
+  G.every = (ms, fn) => { G.ivs.push(setInterval(() => { if (!G.over) fn(); }, ms)); };
+  G.stop = () => { G.timers.forEach(clearTimeout); G.ivs.forEach(clearInterval); };
+  // credit: 1 = clean answer, 0 = wrong; in between for hints or answers left over by elimination.
+  G.result = (i, credit, secs, hinted) => {
+    const c = Math.round((credit === true ? 1 : credit === false ? 0 : +credit || 0) * 100) / 100;
+    const row = [G.P[i].n, c, Math.round((secs || 0) * 10) / 10];
+    if (hinted) row.push('h');
+    G.results.push(row);
+    if (!c || hinted) G.missed.push(G.P[i].n);
+  };
+  // Easy/Medium leave the unanswered places blank, so the last few are partly guessed by elimination.
+  G.elim = (left) => (G.lvl >= 2 ? 1 : left <= 1 ? 0.1 : left === 2 ? 0.35 : left === 3 ? 0.6 : 1);
+  G.hintCredit = (n) => (n <= 0 ? 1 : n === 1 ? 0.5 : 0.2);
+  // Hint on the map: first the county/region (or neighbourhood) it's in, then the place itself.
+  G.mapHint = (t, n) => {
+    const p = G.P[t];
+    if (G.pack.kind === 'roads') {
+      if (n === 1) {
+        const through = (G.pack.towns || []).map((tn, j) => [tn, j]).filter(([tn]) => tn.r.includes(t)).slice(0, 3);
+        if (!through.length) { toast('No towns listed along this one', 1600); return; }
+        through.forEach(([, j]) => G.mv.town(j, 1, 'hint'));
+        G.after(3500, () => through.forEach(([, j]) => G.mv.town(j, 0, '')));
+        toast('It goes through ' + through.map(([tn]) => tn.n).join(', '), 2600);
+      } else { G.mv.cls(t, 'hint'); G.mv.focus(t); }
+      return;
+    }
+    const grouped = p.g != null && G.pack.groups.length > 1;
+    if (n === 1) {
+      const area = grouped ? G.pack.groupMembers[p.g] : [t].concat(p.nb);
+      area.forEach((j) => G.mv.flash(j, 'sel', 2600));
+      G.mv.fit(G.mv.bboxOf(area), true, 40);
+      toast(grouped ? 'It’s in ' + G.pack.groups[p.g] + (G.pack.groupNoun === 'County' ? ' County' : '') : 'It’s somewhere in the outlined area', 2200);
+    } else { G.mv.cls(t, 'hint'); G.mv.focus(t); }
+  };
+  G.announce = (html) => {
+    const a = document.createElement('div');
+    a.className = 'announce';
+    a.innerHTML = html;
+    G.stage.appendChild(a);
+    setTimeout(() => a.remove(), 1300);
+  };
+  G.blind = G.lvl === 3;
+  // Quiz set: weakest and never-asked places first, then shuffled.
+  G.pick = (frac, from, cap) => {
+    const s = (from || G.scope).slice();
+    const n = s.length;
+    let k = frac >= 1 ? n : clamp(Math.round(n * frac), Math.min(n, 3), n);
+    if (cap) k = Math.min(k, cap);
+    const w = (i) => { const l = lvlOf(G.prog, G.P[i].n); return (l < 0 ? 1.2 : l) + Math.random() * 2.2; };
+    return shuffle(s.map((i) => [w(i), i]).sort((a, b) => a[0] - b[0]).slice(0, k).map((x) => x[1]));
+  };
+  // Names on the map: quizzed places hidden; the others shown on Easy/Medium.
+  G.labelsBase = (quiz) => {
+    const qs = new Set(quiz);
+    G.P.forEach((p) => {
+      if (!G.inScope.has(p.i)) G.mv.label(p.i, G.lvl < 2 ? 3 : 0);
+      else G.mv.label(p.i, qs.has(p.i) || G.lvl >= 2 ? 0 : 1);
+    });
+    G.mv.ctxLabels(!G.blind);
+  };
+  G.reveal = (i) => { if (!G.blind) G.mv.label(i, 1); };
+  G.secs = () => (Date.now() - G.t0) / 1000;
+  G.end = (x) => finishGame(G, x || {});
+  G.addKeys = (fn) => { G.keys = fn; document.addEventListener('keydown', fn); };
+  G.feedAdd = (text) => {
+    const s = document.createElement('span');
+    s.textContent = text;
+    G.feed.prepend(s);
+    while (G.feed.children.length > 4) G.feed.lastChild.remove();
+    setTimeout(() => s.remove(), 3500);
+  };
+  G.clock = (limitSecs, onEnd) => {
+    const bar = $('.timerbar', G.root);
+    bar.classList.remove('hide');
+    G.deadline = Date.now() + limitSecs * 1000;
+    const tick = () => {
+      const left = Math.max(0, (G.deadline - Date.now()) / 1000);
+      $('i', bar).style.width = (left / limitSecs * 100) + '%';
+      if (G.onClock) G.onClock(left);
+      if (left <= 0) onEnd();
+    };
+    G.every(250, tick);
+    tick();
+  };
+  return G;
+}
+
+function askQuit(G) {
+  if (G.over || G.cfg.mode === 'study' || !G.results.length) { closeGame(); return; }
+  const m = document.createElement('div');
+  m.className = 'modal';
+  m.innerHTML = '<div class="card"><b>Quit this game?</b><p class="muted">It won’t be saved.</p><div class="btncol"><button class="btn primary" data-a="end">Finish and save what I did</button><button class="btn" data-a="quit">Quit without saving</button><button class="btn" data-a="stay">Keep playing</button></div></div>';
+  m.addEventListener('click', (e) => {
+    const a = e.target.closest('[data-a]');
+    if (!a && e.target !== m) return;
+    m.remove();
+    if (!a) return;
+    if (a.dataset.a === 'quit') closeGame();
+    if (a.dataset.a === 'end') G.end({ quit: true });
+  });
+  document.body.appendChild(m);
+}
+
+function mask(name, show) {
+  let seen = 0;
+  return name.split('').map((c) => {
+    if (!/[\p{L}\p{N}]/u.test(c)) return c === ' ' ? ' ' : c;
+    seen++;
+    return seen <= show ? c : '_';
+  }).join(' ');
+}
+function nearestPlaces(G, t, n, pool) {
+  const p = G.P[t];
+  return (pool || G.P.map((q) => q.i)).filter((i) => i !== t)
+    .map((i) => [(G.P[i].lx - p.lx) ** 2 + (G.P[i].ly - p.ly) ** 2, i]).sort((a, b) => a[0] - b[0]).slice(0, n).map((x) => x[1]);
+}
+
+// ---------- Study ----------
+function modeStudy(G) {
+  let names = true;
+  const setNames = () => G.scope.forEach((i) => G.mv.label(i, names ? 1 : 0));
+  G.P.forEach((p) => { if (!G.inScope.has(p.i)) G.mv.label(p.i, 3); });
+  setNames();
+  G.setPrompt('Study<small>' + esc(G.cfg.scope.label) + ' · tap any ' + esc(G.noun) + '</small>');
+  G.setMeter('<b>' + G.scope.length + '</b> ' + esc(G.nouns));
+  G.panel.innerHTML = '<form class="answer"><input placeholder="Find a ' + esc(G.noun) + '…" autocomplete="off" autocorrect="off" spellcheck="false"><button class="btn primary">Find</button></form>'
+    + '<div class="panelrow"><button class="btn" data-a="names">Hide names</button><span class="muted grow" style="font-size:13px">With names hidden, tap a place to reveal it.</span></div>';
+  const inp = $('input', G.panel);
+  const info = (i) => {
+    const p = G.P[i];
+    const l = lvlOf(G.prog, p.n);
+    const through = G.pack.kind === 'roads' ? (G.pack.towns || []).filter((tn) => tn.r.includes(i)).slice(0, 4).map((tn) => tn.n) : [];
+    return p.n + (through.length ? ' · ' + through.join(', ') : G.pack.groups.length && p.g != null ? ' · ' + G.pack.groups[p.g] : '') + (l >= 0 ? ' · level ' + Math.floor(l) + '/5' : '');
+  };
+  G.onTap = (i) => {
+    if (i < 0) return;
+    G.mv.pop(i, info(i), '', 2200);
+    G.P[i].nb.forEach((j) => G.mv.flash(j, 'sel', 1200));
+    if (!names) G.mv.label(i, 2);
+  };
+  $('[data-a="names"]', G.panel).addEventListener('click', (e) => {
+    names = !names;
+    e.target.textContent = names ? 'Hide names' : 'Show names';
+    setNames();
+  });
+  $('form', G.panel).addEventListener('submit', (e) => {
+    e.preventDefault();
+    const k = norm(inp.value);
+    if (!k) return;
+    const hit = G.P.find((p) => p.keys.includes(k)) || G.P.find((p) => p.keys.some((x) => x.startsWith(k))) || G.P.find((p) => p.keys.some((x) => x.includes(k)));
+    if (!hit) { toast('No ' + G.noun + ' called “' + inp.value + '”'); return; }
+    G.mv.focus(hit.i, 60);
+    G.mv.flash(hit.i, 'hint', 2400);
+    G.after(380, () => G.mv.pop(hit.i, info(hit.i), '', 2600));
+    inp.blur();
+  });
+}
+
+// ---------- Label Drop ----------
+function modeDrop(G) {
+  const quiz = G.pick(FRACS[G.lvl]);
+  G.labelsBase(quiz);
+  quiz.forEach((i) => G.mv.cls(i, 'blank'));
+  const queue = quiz.slice(), total = quiz.length, miss = {}, hints = {};
+  let tray = [], sel = null, placed = 0, tq = Date.now();
+  G.panel.innerHTML = '<div class="tray"></div><div class="panelrow"><span class="muted grow" style="font-size:12.5px">Swipe the names sideways; drag one up onto the map.</span><button class="btn" data-a="hint">Hint</button></div>';
+  const trayEl = $('.tray', G.panel);
+  const refill = () => { while (tray.length < 7 && queue.length) tray.push(queue.shift()); render(); };
+  const render = () => {
+    trayEl.innerHTML = tray.map((i) => '<button class="tile ' + (miss[i] === 1 ? 'miss1' : miss[i] >= 2 ? 'miss2' : '') + (sel === i ? ' sel' : '') + '" data-i="' + i + '">' + esc(G.P[i].n) + '</button>').join('');
+  };
+  const meter = () => G.setMeter('<b>' + placed + '</b>/' + total);
+  G.setPrompt('Drag each name onto its ' + esc(G.noun) + '<small>or tap a name, then tap the map</small>');
+  function attempt(i, at) {
+    if (at < 0 || !G.inScope.has(at)) return;
+    if (at === i) {
+      const first = !miss[i];
+      G.result(i, first ? G.hintCredit(hints[i] || 0) * G.elim(total - placed) : 0, (Date.now() - tq) / 1000, !!hints[i]);
+      tq = Date.now();
+      G.mv.cls(i, 'blank', false); G.mv.cls(i, 'hint', false); G.mv.cls(i, first ? 'okl' : 'badl');
+      G.reveal(i);
+      if (G.blind) G.mv.pop(i, G.P[i].n, 'ok', 800);
+      beep('ok');
+      tray = tray.filter((x) => x !== i);
+      if (sel === i) sel = null;
+      placed++;
+      refill(); meter();
+      if (placed === total) G.after(600, () => G.end());
+      return;
+    }
+    miss[i] = (miss[i] || 0) + 1;
+    beep('bad');
+    G.mv.flash(at, 'flashbad');
+    if (G.lvl === 0 && !G.mv.has(at, 'blank')) G.mv.pop(at, G.P[at].n, 'bad');
+    if (miss[i] >= 3) { G.mv.cls(i, 'hint'); G.mv.focus(i); }
+    render();
+  }
+  trayEl.addEventListener('pointerdown', (e) => {
+    const b = e.target.closest('.tile');
+    if (!b || G.over) return;
+    const touch = e.pointerType !== 'mouse';
+    if (!touch) e.preventDefault();
+    const i = +b.dataset.i, sx = e.clientX, sy = e.clientY;
+    let ghost = null, hov = -1;
+    try { b.setPointerCapture(e.pointerId); } catch (er) { /* ignore */ }
+    const pt = (ev) => ({ x: ev.clientX, y: ev.clientY - (touch ? 46 : 0) });
+    const move = (ev) => {
+      const dx = ev.clientX - sx, dy = ev.clientY - sy;
+      // on a phone, sideways swipes scroll the tray (the browser takes those); mostly-vertical moves drag
+      if (!ghost && Math.hypot(dx, dy) > 8 && (!touch || Math.abs(dy) > Math.abs(dx))) {
+        ghost = document.createElement('div');
+        ghost.className = 'ghost';
+        ghost.textContent = G.P[i].n;
+        document.body.appendChild(ghost);
+        b.style.opacity = 0.35;
+      }
+      if (!ghost) return;
+      const p = pt(ev);
+      ghost.style.left = p.x + 'px'; ghost.style.top = p.y + 'px';
+      const h = G.mv.hitAt(p.x, p.y);
+      if (h !== hov) { if (hov >= 0) G.mv.cls(hov, 'hov', false); hov = h >= 0 && G.inScope.has(h) && G.mv.has(h, 'blank') ? h : -1; if (hov >= 0) G.mv.cls(hov, 'hov'); }
+    };
+    const up = (ev) => {
+      b.removeEventListener('pointermove', move); b.removeEventListener('pointerup', up); b.removeEventListener('pointercancel', up);
+      if (hov >= 0) G.mv.cls(hov, 'hov', false);
+      if (!ghost) { sel = sel === i ? null : i; render(); return; }
+      ghost.remove();
+      b.style.opacity = '';
+      if (ev.type === 'pointercancel') return;
+      const p = pt(ev);
+      attempt(i, G.mv.hitAt(p.x, p.y));
+    };
+    b.addEventListener('pointermove', move);
+    b.addEventListener('pointerup', up);
+    b.addEventListener('pointercancel', up);
+  });
+  G.panel.addEventListener('click', (e) => {
+    if (!e.target.closest('[data-a="hint"]') || !tray.length) return;
+    const i = sel != null ? sel : tray[0];
+    sel = i;
+    hints[i] = Math.min(2, (hints[i] || 0) + 1);
+    G.mapHint(i, hints[i]);
+    render();
+  });
+  G.onTap = (i) => {
+    if (sel != null) { attempt(sel, i); return; }
+    if (i >= 0 && G.inScope.has(i) && G.mv.has(i, 'blank')) toast('Pick a name first, then tap its ' + G.noun, 1500);
+  };
+  refill(); meter();
+}
+
+// ---------- Pinpoint ----------
+function modeFind(G) {
+  const quiz = G.pick(FRACS[G.lvl]);
+  G.labelsBase(quiz);
+  if (G.lvl < 2) quiz.forEach((i) => G.mv.cls(i, 'blank'));
+  let k = 0, t = -1, miss = 0, hints = 0, tq = 0;
+  G.panel.innerHTML = '<div class="panelrow" style="margin:0"><span class="muted grow" style="font-size:13px">Tap it on the map.</span><button class="btn" data-a="hint">Hint</button></div>';
+  G.panel.addEventListener('click', (e) => {
+    if (!e.target.closest('[data-a="hint"]') || t < 0) return;
+    hints = Math.min(2, hints + 1);
+    G.mapHint(t, hints);
+  });
+  function next() {
+    if (k >= quiz.length) { G.end(); return; }
+    t = quiz[k++]; miss = 0; hints = 0; tq = Date.now();
+    G.announce('Find<b>' + esc(G.P[t].n) + '</b>');
+    G.setPrompt('Find <b>' + esc(G.P[t].n) + '</b>');
+    G.setMeter('<b>' + k + '</b>/' + quiz.length);
+  }
+  G.onTap = (i) => {
+    if (t < 0 || i < 0) return;
+    if (!G.inScope.has(i)) { G.mv.pop(i, 'Not in this round', '', 900); return; }
+    if (i === t) {
+      const ok = miss === 0;
+      G.result(t, ok ? G.hintCredit(hints) * G.elim(quiz.length - k + 1) : 0, (Date.now() - tq) / 1000, hints > 0);
+      G.mv.cls(t, 'blank', false); G.mv.cls(t, 'hint', false); G.mv.cls(t, ok && !hints ? 'okl' : 'badl');
+      G.reveal(t);
+      beep('ok');
+      t = -1;
+      G.after(250, next);
+      return;
+    }
+    miss++;
+    beep('bad');
+    G.mv.flash(i, 'flashbad');
+    if (!G.blind) G.mv.pop(i, G.P[i].n, 'bad');
+    if (miss === 3) { G.mv.cls(t, 'hint'); G.mv.focus(t); }
+  };
+  next();
+}
+
+// ---------- Name It ----------
+function modeType(G) {
+  const quiz = G.pick(FRACS[G.lvl]);
+  G.labelsBase(quiz);
+  let k = 0, t = -1, tries = 0, hints = 0, tq = 0;
+  G.panel.innerHTML = '<form class="answer"><input autocomplete="off" autocapitalize="words" autocorrect="off" spellcheck="false" enterkeyhint="go" placeholder="Name this ' + esc(G.noun) + '"><button class="btn primary">Enter</button></form>'
+    + '<div class="panelrow"><div class="hintline grow"></div>' + '<button class="btn" type="button" data-a="hint">Hint</button>' + '<button class="btn" type="button" data-a="skip">Show me</button></div>';
+  const inp = $('input', G.panel), hl = $('.hintline', G.panel);
+  // Easy starts with the first letter showing; each hint adds a letter
+  const hintText = () => (G.lvl <= 1 || hints ? mask(G.P[t].n, (G.lvl === 0 ? 1 : 0) + hints) : '');
+  function next() {
+    if (k >= quiz.length) { G.end(); return; }
+    t = quiz[k++]; tries = 0; hints = 0; tq = Date.now();
+    G.mv.cls(t, 'tgt');
+    G.mv.focus(t, 44);
+    G.setPrompt('Name the highlighted ' + esc(G.noun));
+    G.setMeter('<b>' + k + '</b>/' + quiz.length);
+    inp.value = '';
+    hl.textContent = hintText();
+    inp.focus();
+  }
+  function done(credit, hinted) {
+    const tt = t, ok = credit > 0;
+    t = -1;
+    G.result(tt, credit, (Date.now() - tq) / 1000, hinted);
+    G.mv.cls(tt, 'tgt', false);
+    G.mv.cls(tt, ok && !hinted ? 'okl' : 'badl');
+    G.reveal(tt);
+    G.mv.pop(tt, G.P[tt].n, ok ? 'ok' : 'bad', ok ? 900 : 1900);
+    G.after(ok ? 650 : 1700, next);
+  }
+  $('form', G.panel).addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (t < 0) return;
+    const r = judge(G.pack, inp.value, t);
+    if (r.empty) return;
+    if (r.ok) { beep('ok'); done(tries === 0 ? G.hintCredit(hints) : 0, hints > 0); return; }
+    tries++;
+    beep('bad');
+    inp.classList.remove('shake'); void inp.offsetWidth; inp.classList.add('shake');
+    if (r.other != null && !G.blind) { G.mv.flash(r.other, 'flashbad', 1300); G.mv.pop(r.other, 'That’s ' + G.P[r.other].n, 'bad', 1600); }
+    inp.select();
+    if (tries >= 3) done(0);
+    else if (G.lvl < 2) { hints++; hl.textContent = hintText(); }
+  });
+  G.panel.addEventListener('click', (e) => {
+    const a = e.target.closest('[data-a]');
+    if (!a || t < 0) return;
+    if (a.dataset.a === 'hint') { hints++; hl.textContent = hintText(); inp.focus(); }
+    if (a.dataset.a === 'skip') done(0);
+  });
+  G.onTap = (i) => { if (i === t) inp.focus(); };
+  next();
+}
+
+// ---------- Name Wheel ----------
+function modeWheel(G) {
+  const quiz = G.pick(FRACS[G.lvl]);
+  G.labelsBase(quiz);
+  const nOpt = [3, 5, 8, 0][G.lvl];
+  const allNames = G.P.map((p) => p.i).sort((a, b) => G.P[a].n.localeCompare(G.P[b].n));
+  let k = 0, t = -1, opts = [], at = 0, wrong = 0, hinted = false, tq = 0;
+  G.panel.innerHTML = '<div class="wheel"><button class="arrow" data-d="-1" aria-label="Previous">‹</button><div class="face"></div><button class="arrow" data-d="1" aria-label="Next">›</button></div>'
+    + (nOpt ? '' : '<div class="letters">' + Array.from(new Set(allNames.map((i) => norm(G.P[i].n)[0].toUpperCase()))).map((L) => '<button data-l="' + L + '">' + L + '</button>').join('') + '</div>')
+    + '<div class="panelrow"><button class="btn" data-a="hint">Hint</button><button class="btn primary grow" data-a="pick">That’s it</button></div>';
+  const face = $('.face', G.panel);
+  const show = () => { face.innerHTML = esc(G.P[opts[at]].n) + '<small>' + (at + 1) + ' of ' + opts.length + '</small>'; };
+  const step = (d) => { if (t < 0) return; at = (at + d + opts.length) % opts.length; show(); };
+  function next() {
+    if (k >= quiz.length) { G.end(); return; }
+    t = quiz[k++]; wrong = 0; hinted = false; tq = Date.now();
+    opts = nOpt ? [t].concat(nearestPlaces(G, t, nOpt - 1)).sort((a, b) => G.P[a].n.localeCompare(G.P[b].n)) : allNames.slice();
+    at = Math.floor(Math.random() * opts.length);
+    if (opts[at] === t) at = (at + 1) % opts.length;
+    G.mv.cls(t, 'tgt');
+    G.mv.focus(t, 44);
+    G.setPrompt('Which ' + esc(G.noun) + ' is highlighted?');
+    G.setMeter('<b>' + k + '</b>/' + quiz.length);
+    show();
+  }
+  function pick() {
+    if (t < 0) return;
+    const c = opts[at];
+    if (c === t) {
+      const tt = t;
+      t = -1;
+      beep('ok');
+      G.result(tt, wrong ? 0 : hinted ? 0.5 : 1, (Date.now() - tq) / 1000, hinted);
+      G.mv.cls(tt, 'tgt', false); G.mv.cls(tt, wrong || hinted ? 'badl' : 'okl');
+      G.reveal(tt);
+      G.mv.pop(tt, G.P[tt].n, wrong ? 'bad' : 'ok', 900);
+      G.after(650, next);
+      return;
+    }
+    wrong++;
+    beep('bad');
+    face.classList.remove('shake'); void face.offsetWidth; face.classList.add('shake');
+    if (!G.blind) G.mv.flash(c, 'flashbad', 900);
+    opts.splice(at, 1);
+    at %= opts.length;
+    if (wrong >= 3 && G.blind) at = opts.indexOf(t);
+    show();
+  }
+  G.panel.addEventListener('click', (e) => {
+    const d = e.target.closest('[data-d]'), l = e.target.closest('[data-l]'), a = e.target.closest('[data-a]');
+    if (d) step(+d.dataset.d);
+    if (a && a.dataset.a === 'pick') pick();
+    if (a && a.dataset.a === 'hint' && t >= 0 && !hinted) {
+      hinted = true;
+      const bad = shuffle(opts.filter((i) => i !== t));
+      const drop = new Set(bad.slice(0, Math.ceil(bad.length / 2)));
+      const cur = opts[at];
+      opts = opts.filter((i) => !drop.has(i));
+      at = Math.max(0, opts.indexOf(cur));
+      show();
+      toast('Took out ' + drop.size + ' wrong name' + (drop.size === 1 ? '' : 's'), 1400);
+    }
+    if (l && t >= 0) { const j = opts.findIndex((i) => norm(G.P[i].n)[0].toUpperCase() === l.dataset.l); if (j >= 0) { at = j; show(); } }
+  });
+  let sx = null;
+  face.addEventListener('pointerdown', (e) => { sx = e.clientX; });
+  face.addEventListener('pointerup', (e) => { if (sx != null && Math.abs(e.clientX - sx) > 30) step(e.clientX < sx ? 1 : -1); sx = null; });
+  G.addKeys((e) => {
+    if (e.key === 'ArrowLeft') step(-1);
+    else if (e.key === 'ArrowRight') step(1);
+    else if (e.key === 'Enter') pick();
+    else if (!nOpt && /^[a-z]$/i.test(e.key)) { const j = opts.findIndex((i) => norm(G.P[i].n)[0] === e.key.toLowerCase()); if (j >= 0) { at = j; show(); } }
+  });
+  G.onTap = () => {};
+  next();
+}
+
+// ---------- Name 'em All ----------
+function modeAll(G) {
+  const targets = G.scope.slice(), n = targets.length, found = new Set();
+  G.P.forEach((p) => {
+    if (!G.inScope.has(p.i)) G.mv.label(p.i, G.lvl < 2 ? 3 : 0);
+    else if (G.lvl === 0) G.mv.label(p.i, 1, norm(p.n)[0].toUpperCase());
+    else G.mv.label(p.i, 0);
+  });
+  targets.forEach((i) => G.mv.cls(i, 'blank'));
+  G.mv.ctxLabels(!G.blind);
+  if (G.blind) { if (G.pack.kind === 'roads') G.mv.hideRoads(true); else { G.mv.borders(false); G.mv.groupLines(false); } }
+  const limit = G.lvl >= 2 ? Math.max(60, Math.round(n * (G.lvl === 2 ? 9 : 7))) : 0;
+  G.setPrompt('Name every ' + esc(G.noun) + ' you can<small>' + esc(G.cfg.scope.label) + ' · any order</small>');
+  G.panel.innerHTML = '<form class="answer"><input autocomplete="off" autocapitalize="words" autocorrect="off" spellcheck="false" placeholder="Type a name…"><button class="btn" type="button" data-a="give">I’m done</button></form><div class="hintline"></div>';
+  const inp = $('input', G.panel), hl = $('.hintline', G.panel);
+  let last = Date.now();
+  const meter = (left) => G.setMeter('<b>' + found.size + '</b>/' + n + '<br>' + (limit ? fmtSecs(left == null ? limit : left) : fmtSecs(G.secs())));
+  function accept(i) {
+    found.add(i);
+    G.result(i, true, (Date.now() - last) / 1000);
+    last = Date.now();
+    G.mv.cls(i, 'blank', false); G.mv.cls(i, 'okl');
+    G.mv.label(i, G.blind ? 0 : 1);
+    G.feedAdd(G.P[i].n);
+    beep('ok');
+    inp.value = '';
+    hl.textContent = '';
+    meter();
+    if (found.size === n) G.after(400, finish);
+  }
+  inp.addEventListener('input', () => {
+    const k = norm(inp.value);
+    if (!k) return;
+    const c = (G.pack.byKey.get(k) || []).filter((i) => G.inScope.has(i));
+    const open = c.filter((i) => !found.has(i));
+    if (!open.length) { if (c.length && c.every((i) => found.has(i)) && c.some((i) => G.P[i].key === k)) hl.textContent = 'Already got ' + G.P[c[0]].n; return; }
+    let pick = open.filter((i) => G.P[i].key === k);
+    if (!pick.length) pick = open;
+    if (pick.length === 1) accept(pick[0]);
+  });
+  $('form', G.panel).addEventListener('submit', (e) => { e.preventDefault(); });
+  function finish() {
+    if (G.over) return;
+    const missedIdx = targets.filter((i) => !found.has(i));
+    missedIdx.forEach((i) => { G.result(i, false, 0); G.mv.cls(i, 'blank', false); G.mv.cls(i, 'badl'); G.mv.label(i, 3); });
+    G.results.sort((a, b) => b[1] - a[1]);
+    G.end({ right: found.size, q: n, score: found.size });
+  }
+  $('[data-a="give"]', G.panel).addEventListener('click', finish);
+  G.onTap = (i) => { if (i >= 0 && found.has(i)) G.mv.pop(i, G.P[i].n, 'ok', 900); inp.focus(); };
+  if (limit) { G.onClock = (left) => meter(left); G.clock(limit, finish); } else { meter(); G.every(1000, () => meter()); }
+  inp.focus();
+}
+
+// ---------- Border Patrol ----------
+function modeBorder(G) {
+  const eligible = G.scope.filter((i) => G.P[i].nb.length >= 1);
+  if (!eligible.length) { G.setPrompt('No land borders here'); G.panel.innerHTML = '<p class="muted">These ' + esc(G.nouns) + ' are all islands. Try another game.</p>'; return; }
+  const rounds = G.pick(1, eligible, [5, 8, 10, 10][G.lvl]);
+  G.labelsBase(G.P.map((p) => p.i));
+  G.mv.ctxLabels(!G.blind);
+  let r = 0, t = -1, opts = [], chosen = new Set(), checked = false, right = 0, q = 0, tq = 0;
+  function next() {
+    if (r >= rounds.length) { G.end({ right, q, score: right }); return; }
+    if (t >= 0) { G.mv.cls(t, 'tgt', false); G.mv.clearCls('okl badl'); G.mv.labelAll(0); }
+    t = rounds[r++]; checked = false; chosen = new Set(); tq = Date.now();
+    const nb = G.P[t].nb;
+    const two = new Set();
+    nb.forEach((j) => G.P[j].nb.forEach((x) => { if (x !== t && !nb.includes(x)) two.add(x); }));
+    const nDecoy = [Math.max(2, Math.ceil(nb.length / 2)), nb.length + 1, nb.length + 2, nb.length + 2][G.lvl];
+    let decoys = shuffle(Array.from(two)).slice(0, nDecoy);
+    if (decoys.length < nDecoy) decoys = decoys.concat(nearestPlaces(G, t, nDecoy * 2).filter((x) => !nb.includes(x) && !decoys.includes(x)).slice(0, nDecoy - decoys.length));
+    opts = shuffle(nb.concat(decoys));
+    if (!G.blind) { G.mv.cls(t, 'tgt'); G.mv.fit(G.mv.bboxOf([t].concat(nb)), true, 40); } else G.mv.fitHome(true);
+    G.setPrompt('Which ' + esc(G.nouns) + (G.pack.kind === 'roads' ? ' meet' : ' border') + ' <b>' + esc(G.P[t].n) + '</b>?<small>' + (G.lvl < 2 ? nb.length + ' to find' : 'Pick all that apply') + '</small>');
+    G.setMeter('<b>' + r + '</b>/' + rounds.length);
+    render();
+  }
+  function render() {
+    const nb = G.P[t].nb;
+    G.panel.innerHTML = '<div class="chipline">' + opts.map((i) => {
+      let c = chosen.has(i) ? 'chip on' : 'chip';
+      let style = '';
+      if (checked) {
+        if (nb.includes(i)) style = chosen.has(i) ? 'background:var(--ok);border-color:var(--ok);color:#fff' : 'border:2px solid var(--bad)';
+        else if (chosen.has(i)) style = 'background:var(--bad);border-color:var(--bad);color:#fff';
+      }
+      return '<button class="' + c + '" style="' + style + '" data-i="' + i + '">' + esc(G.P[i].n) + '</button>';
+    }).join('') + '</div><div class="panelrow"><span class="muted grow" style="font-size:13px">' + (checked ? '' : chosen.size + ' picked') + '</span><button class="btn primary" data-a="go">' + (checked ? 'Next ›' : 'Check') + '</button></div>';
+  }
+  function check() {
+    const nb = G.P[t].nb;
+    checked = true;
+    let good = 0, bad = 0;
+    opts.forEach((i) => {
+      if (nb.includes(i)) { if (chosen.has(i)) good++; G.mv.cls(i, chosen.has(i) ? 'okl' : 'badl'); G.mv.label(i, 2); }
+      else if (chosen.has(i)) bad++;
+    });
+    G.mv.label(t, 2);
+    if (G.blind) { G.mv.cls(t, 'tgt'); G.mv.fit(G.mv.bboxOf([t].concat(nb)), true, 40); }
+    right += good; q += nb.length + bad;
+    const ok = good === nb.length && !bad;
+    G.result(t, ok, (Date.now() - tq) / 1000);
+    beep(ok ? 'ok' : 'bad');
+    render();
+  }
+  G.panel.addEventListener('click', (e) => {
+    const c = e.target.closest('[data-i]'), a = e.target.closest('[data-a]');
+    if (c && !checked) {
+      const i = +c.dataset.i;
+      chosen.has(i) ? chosen.delete(i) : chosen.add(i);
+      render();
+      if (G.lvl < 2 && chosen.size === G.P[t].nb.length) G.after(250, () => { if (!checked) check(); });
+    }
+    if (a) checked ? next() : check();
+  });
+  G.onTap = (i) => { if (i >= 0 && checked) G.mv.pop(i, G.P[i].n, '', 1000); };
+  next();
+}
+
+// ---------- Road Trip (road maps) ----------
+// Get from one town to another by naming roads in order: the first road must go
+// through the start town, each next one must meet the last, the last must reach the finish.
+function modeTrip(G) {
+  const towns = G.pack.towns || [], allowed = G.inScope;
+  const usable = (j) => towns[j].r.filter((i) => allowed.has(i));
+  const roadsName = (list) => list.map((i) => G.P[i].n).join(' → ');
+  function shortest(from, to) {
+    const prev = new Map(), q = [];
+    from.forEach((i) => { prev.set(i, -1); q.push(i); });
+    while (q.length) {
+      const x = q.shift();
+      if (to.has(x)) { const path = [x]; while (prev.get(path[0]) !== -1) path.unshift(prev.get(path[0])); return path; }
+      for (const y of G.P[x].nb) if (allowed.has(y) && !prev.has(y)) { prev.set(y, x); q.push(y); }
+    }
+    return null;
+  }
+  // start and finish towns: crossroads towns first
+  const cands = towns.map((t, j) => j).filter((j) => usable(j).length).sort((a, b) => usable(b).length - usable(a).length);
+  const pool = cands.slice(0, Math.max(12, Math.round(cands.length * 0.6)));
+  const nRounds = [3, 4, 5, 5][G.lvl], maxRoads = G.lvl < 2 ? 3 : 4, minDist = Math.max(G.pack.w, G.pack.h) * 0.12;
+  const trips = [];
+  for (let pass = 0; pass < 2 && trips.length < nRounds; pass++) {
+    for (let tries = 0; tries < 400 && trips.length < nRounds; tries++) {
+      const a = pool[Math.floor(Math.random() * pool.length)], b = pool[Math.floor(Math.random() * pool.length)];
+      if (a === b || trips.some((t) => t[0] === a || t[1] === b)) continue;
+      if (Math.hypot(towns[a].lx - towns[b].lx, towns[a].ly - towns[b].ly) < minDist * (pass ? 0.4 : 1)) continue;
+      const path = shortest(usable(a), new Set(usable(b)));
+      if (!path || path.length > maxRoads || path.length < (pass ? 1 : 2)) continue;
+      trips.push([a, b, path]);
+    }
+  }
+  if (!trips.length) { G.setPrompt('No road trips here'); G.panel.innerHTML = '<p class="muted">Not enough towns on these roads for a trip. Try All, or another game.</p>'; return; }
+  const pick = G.lvl >= 2;
+  G.mv.ctxLabels(!G.blind);
+  G.mv.townsAuto(!G.blind);
+  if (G.blind) G.mv.hideRoads(true);
+  G.panel.innerHTML = '<div class="tripinfo" style="font-size:14px;margin-bottom:6px"></div>' + (pick ? '<div class="chipline tripchips"></div>' : '')
+    + '<div class="panelrow"><span class="grow"></span><button class="btn" data-a="undo">Undo</button><button class="btn" data-a="give">Show a route</button></div>';
+  const info = $('.tripinfo', G.panel), chipsEl = $('.tripchips', G.panel);
+  let r = 0, A = null, B = null, best = [], route = [], wrong = 0, done = false, effSum = 0, tq = 0, chips = [];
+  function chipsFor(a, b, path) {
+    const s = new Set();
+    usable(a).forEach((i) => s.add(i)); usable(b).forEach((i) => s.add(i));
+    path.forEach((i) => G.P[i].nb.forEach((j) => { if (allowed.has(j)) s.add(j); }));
+    const extra = shuffle(Array.from(s).filter((i) => !path.includes(i))).slice(0, Math.max(6, 16 - path.length));
+    return path.concat(extra).sort((x, y) => x - y); // pack order: interstates, US routes, state routes by number
+  }
+  function paint() {
+    G.mv.clearCls('route okl');
+    G.P.forEach((p) => G.mv.label(p.i, G.lvl === 0 && allowed.has(p.i) ? 1 : 0));
+    route.forEach((i) => { G.mv.cls(i, done ? 'okl' : 'route'); G.mv.label(i, 2); });
+    const start = 'Start on a road through ' + towns[A].n + '.';
+    info.innerHTML = (route.length ? '<b>' + esc(roadsName(route)) + '</b>' : esc(start)) + (G.lvl === 0 ? ' <span class="muted">· shortest: ' + best.length + ' road' + (best.length > 1 ? 's' : '') + '</span>' : '');
+    if (chipsEl) chipsEl.innerHTML = chips.map((i) => '<button class="chip' + (route.includes(i) ? ' on' : '') + '" data-i="' + i + '">' + esc(G.P[i].n) + '</button>').join('');
+  }
+  function next() {
+    if (r >= trips.length) { G.end({ right: Math.round(effSum * 100), q: trips.length * 100, score: Math.round(effSum / trips.length * 100) }); return; }
+    if (A != null) { G.mv.town(A, 0, ''); G.mv.town(B, 0, ''); }
+    [A, B, best] = trips[r++];
+    route = []; wrong = 0; done = false; tq = Date.now();
+    G.mv.town(A, 1, 'start'); G.mv.town(B, 1, 'end');
+    G.setPrompt('Drive from <b>' + esc(towns[A].n) + '</b> to <b>' + esc(towns[B].n) + '</b>');
+    G.setMeter('<b>' + r + '</b>/' + trips.length);
+    chips = pick ? chipsFor(A, B, best) : [];
+    paint();
+    const ta = towns[A], tb = towns[B];
+    G.mv.fit([Math.min(ta.lx, tb.lx), Math.min(ta.ly, tb.ly), Math.max(ta.lx, tb.lx), Math.max(ta.ly, tb.ly)], true, 70);
+  }
+  function bad(i, msg) {
+    wrong++;
+    beep('bad');
+    if (!G.blind) G.mv.flash(i, 'flashbad', 700);
+    if (pick) toast(msg, 1800); else G.mv.pop(i, msg, 'bad', 1500);
+  }
+  function add(i) {
+    if (done || i < 0 || !allowed.has(i)) return;
+    const k = route.indexOf(i);
+    if (k >= 0) { route = route.slice(0, k + 1); paint(); return; }
+    if (!route.length) { if (!towns[A].r.includes(i)) { bad(i, G.P[i].n + ' doesn’t go through ' + towns[A].n); return; } }
+    else { const last = route[route.length - 1]; if (!G.P[last].nb.includes(i)) { bad(i, G.P[i].n + ' doesn’t meet ' + G.P[last].n); return; } }
+    route.push(i);
+    if (towns[B].r.includes(i)) { arrive(); return; }
+    beep('ok');
+    paint();
+  }
+  function arrive() {
+    done = true;
+    const eff = Math.min(1, best.length / route.length);
+    effSum += eff;
+    const clean = eff === 1 && !wrong;
+    route.forEach((i) => G.result(i, clean ? 1 : 0.5, (Date.now() - tq) / 1000 / route.length));
+    paint();
+    beep('done');
+    G.mv.townPop(B, route.length === best.length ? 'Arrived by the shortest route! 🎉' : 'Arrived: ' + route.length + ' roads (shortest ' + best.length + ')', 'ok', 2400);
+    G.after(2700, next);
+  }
+  G.panel.addEventListener('click', (e) => {
+    const c = e.target.closest('[data-i]'), a = e.target.closest('[data-a]');
+    if (c) add(+c.dataset.i);
+    if (!a || done) return;
+    if (a.dataset.a === 'undo' && route.length) { route.pop(); paint(); }
+    if (a.dataset.a === 'give') {
+      done = true;
+      best.forEach((i) => G.result(i, 0, 0));
+      route = best.slice();
+      paint();
+      G.mv.townPop(B, 'One way: ' + roadsName(best), '', 3200);
+      G.after(3400, next);
+    }
+  });
+  G.onTap = (i) => { if (!pick) add(i); };
+  next();
+}
+
+// ---------- Shape Shifter ----------
+function modeShape(G) {
+  const quiz = G.pick(FRACS[G.lvl], null, 25);
+  G.labelsBase(quiz);
+  const silo = document.createElement('div');
+  silo.className = 'silo';
+  silo.innerHTML = '<svg><path/></svg>';
+  G.stage.appendChild(silo);
+  const svg = $('svg', silo), path = $('path', silo);
+  const nOpt = [4, 6, 0, 0][G.lvl];
+  let k = 0, t = -1, wrong = 0, hints = 0, tq = 0;
+  if (nOpt) G.panel.innerHTML = '<div class="choices"></div><div class="panelrow"><span class="grow"></span><button class="btn" data-a="hint">Hint</button></div>';
+  else G.panel.innerHTML = '<form class="answer"><input autocomplete="off" autocapitalize="words" autocorrect="off" spellcheck="false" placeholder="Which ' + esc(G.noun) + ' is this?"><button class="btn primary">Enter</button></form><div class="panelrow"><div class="hintline grow"></div><button class="btn" type="button" data-a="hint">Hint</button><button class="btn" type="button" data-a="skip">Show me</button></div>';
+  const inp = $('input', G.panel);
+  function next() {
+    if (k >= quiz.length) { G.end(); return; }
+    t = quiz[k++]; wrong = 0; hints = 0; tq = Date.now();
+    const hl0 = $('.hintline', G.panel);
+    if (hl0) hl0.textContent = '';
+    const p = G.P[t], bb = p.bb;
+    const side = Math.max(bb[2] - bb[0], bb[3] - bb[1]) * 1.12, cx = (bb[0] + bb[2]) / 2, cy = (bb[1] + bb[3]) / 2;
+    svg.setAttribute('viewBox', (cx - side / 2) + ' ' + (cy - side / 2) + ' ' + side + ' ' + side);
+    path.setAttribute('d', p.d);
+    path.style.transformOrigin = cx + 'px ' + cy + 'px';
+    path.style.transform = G.blind ? 'rotate(' + [90, 180, 270][Math.floor(Math.random() * 3)] + 'deg)' : '';
+    silo.style.display = '';
+    G.setPrompt('Which ' + esc(G.noun) + ' is this?');
+    G.setMeter('<b>' + k + '</b>/' + quiz.length);
+    if (nOpt) {
+      const pool = G.scope.length >= nOpt ? G.scope : G.P.map((q) => q.i);
+      const others = shuffle(pool.filter((i) => i !== t)).slice(0, nOpt - 1);
+      $('.choices', G.panel).innerHTML = shuffle([t].concat(others)).map((i) => '<button data-i="' + i + '">' + esc(G.P[i].n) + '</button>').join('');
+    } else { inp.value = ''; inp.focus(); }
+  }
+  function done(ok) {
+    const tt = t;
+    t = -1;
+    G.result(tt, ok ? G.hintCredit(hints) : 0, (Date.now() - tq) / 1000, hints > 0);
+    beep(ok ? 'ok' : 'bad');
+    silo.style.display = 'none';
+    G.mv.cls(tt, ok ? 'okl' : 'badl');
+    G.mv.label(tt, 2);
+    G.mv.focus(tt, 60);
+    G.after(400, () => G.mv.pop(tt, G.P[tt].n, ok ? 'ok' : 'bad', 1500));
+    G.after(2000, () => { G.mv.label(tt, G.blind ? 0 : 1); G.mv.fitHome(false); next(); });
+  }
+  G.panel.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-i]'), a = e.target.closest('[data-a]');
+    if (a && t >= 0 && a.dataset.a === 'hint') {
+      hints++;
+      if (nOpt) {
+        const wrongBtns = shuffle($$('.choices button:not(:disabled)', G.panel).filter((x) => +x.dataset.i !== t));
+        wrongBtns.slice(0, Math.ceil(wrongBtns.length / 2)).forEach((x) => { x.disabled = true; x.style.opacity = 0.35; });
+      } else $('.hintline', G.panel).textContent = mask(G.P[t].n, hints);
+      return;
+    }
+    if (a && t >= 0) done(false);
+    if (!b || t < 0) return;
+    if (+b.dataset.i === t) { b.classList.add('ok'); done(wrong === 0); }
+    else { wrong++; b.classList.add('bad'); b.disabled = true; beep('bad'); if (wrong >= 2 && nOpt === 4) done(false); else if (wrong >= 3) done(false); }
+  });
+  const form = $('form', G.panel);
+  if (form) form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (t < 0) return;
+    const r = judge(G.pack, inp.value, t);
+    if (r.empty) return;
+    if (r.ok) { done(wrong === 0); return; }
+    wrong++;
+    beep('bad');
+    inp.classList.remove('shake'); void inp.offsetWidth; inp.classList.add('shake');
+    $('.hintline', G.panel).textContent = r.other != null ? 'Not ' + G.P[r.other].n : 'Not quite';
+    inp.select();
+    if (wrong >= 3) done(false);
+  });
+  next();
+}
+
+// ---------- Blitz ----------
+function modeBlitz(G) {
+  const T = [90, 60, 60, 45][G.lvl], pen = G.lvl >= 2 ? 3 : 0;
+  G.labelsBase(G.scope);
+  let pool = [], t = -1, score = 0, misses = 0, skips = 0, missT = 0, tq = 0;
+  G.panel.innerHTML = '<div class="panelrow" style="margin:0"><span class="muted grow" style="font-size:13.5px">Tap it on the map.</span><button class="btn" data-a="skip">Skip</button></div>';
+  function next() {
+    if (!pool.length) { pool = shuffle(G.scope.slice()); G.mv.clearCls('okl badl'); G.scope.forEach((i) => G.mv.label(i, 0)); }
+    t = pool.pop(); missT = 0; tq = Date.now();
+    G.setPrompt('Find <b>' + esc(G.P[t].n) + '</b>');
+  }
+  const meter = (left) => G.setMeter('<b>' + score + '</b> found<br>' + Math.ceil(left) + 's');
+  G.onClock = meter;
+  G.onTap = (i) => {
+    if (i < 0 || t < 0) return;
+    if (!G.inScope.has(i)) return;
+    if (i === t) {
+      score++;
+      G.result(t, missT === 0, (Date.now() - tq) / 1000);
+      G.mv.cls(t, 'hint', false); G.mv.cls(t, 'okl');
+      if (G.lvl < 2) G.mv.label(t, 1);
+      beep('ok');
+      next();
+      return;
+    }
+    misses++; missT++;
+    beep('bad');
+    G.mv.flash(i, 'flashbad');
+    if (G.lvl < 2) G.mv.pop(i, G.P[i].n, 'bad', 900);
+    if (pen) { G.deadline -= pen * 1000; G.mv.pop(i, '−' + pen + 's', 'bad', 700); }
+    if (missT === 3) G.mv.cls(t, 'hint');
+  };
+  G.panel.addEventListener('click', (e) => {
+    if (!e.target.closest('[data-a]') || t < 0) return;
+    skips++;
+    G.result(t, false, 0);
+    G.mv.cls(t, 'hint', false);
+    next();
+  });
+  next();
+  G.clock(T, () => {
+    if (G.over) return;
+    t = -1;
+    G.end({ right: score, q: score + misses + skips, score });
+  });
+}
+
+// ---------- results ----------
+function finishGame(G, x) {
+  if (G.over) return;
+  G.over = true;
+  G.stop();
+  G.onTap = null;
+  const secs = Math.round(G.secs());
+  const right = x.right != null ? x.right : G.results.filter((r) => r[1] > 0 && r[3] !== 'h').length;
+  const q = x.q != null ? x.q : G.results.length;
+  const score = x.score != null ? x.score : right;
+  const acc = q ? right / q : 0;
+  const cfg = G.cfg;
+  if (!q) { closeGame(); return; }
+  const run = {
+    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
+    mapId: cfg.id, title: fullTitle(cfg.id), mode: cfg.mode, modeName: G.mode.n, level: LEVELS[G.lvl], scope: cfg.scope.label,
+    q, right, secs, score, missed: Array.from(new Set(G.missed)), results: G.results,
+  };
+  const before = S.progress.maps[cfg.id] && S.progress.maps[cfg.id].best[run.modeName + '|' + run.level + '|' + run.scope];
+  const { pb } = applyLocally(run);
+  queueRun(run).then((left) => { if (left) toast('Saved on this device; it will reach the sheet next time'); });
+  const stars = acc >= 0.95 ? 3 : acc >= 0.8 ? 2 : acc >= 0.6 ? 1 : 0;
+  const scoreLine = cfg.mode === 'blitz' ? score + ' found' : cfg.mode === 'all' ? score + ' / ' + q : cfg.mode === 'trip' ? score + '% efficient' : pct(acc);
+  const missed = run.missed;
+  const m = document.createElement('div');
+  m.className = 'modal';
+  m.innerHTML = '<div class="card">'
+    + '<div class="stars">' + [0, 1, 2].map((j) => '<span class="' + (j < stars ? '' : 'off') + '">★</span>').join('') + '</div>'
+    + '<div class="bigscore">' + esc(scoreLine) + '</div>'
+    + (pb ? '<div class="pb">New personal best!</div>' : '')
+    + '<p class="muted" style="text-align:center;margin:4px 0 10px">' + esc(G.mode.n) + ' · ' + LEVELS[G.lvl] + ' · ' + esc(cfg.scope.label) + '<br>'
+    + (cfg.mode === 'trip' ? '' : right + ' of ' + q + ' right first try · ') + fmtSecs(secs)
+    + (before && !pb ? ' · best ' + (cfg.mode === 'blitz' || cfg.mode === 'all' ? before[0] : cfg.mode === 'trip' ? before[0] + '%' : pct(before[2])) : '') + '</p>'
+    + (missed.length ? '<b style="font-size:13px">To practice</b><div class="missed">' + missed.slice(0, 40).map((n) => '<span>' + esc(n) + '</span>').join('') + (missed.length > 40 ? '<span>+' + (missed.length - 40) + ' more</span>' : '') + '</div>' : '')
+    + '<div class="btncol"><button class="btn primary" data-a="again">Play again</button>'
+    + (missed.length && cfg.mode !== 'trip' ? '<button class="btn" data-a="misses">Practice these ' + missed.length + '</button>' : '')
+    + '<button class="btn" data-a="look">Look at the map</button><button class="btn" data-a="back">Done</button></div></div>';
+  m.addEventListener('click', (e) => {
+    const a = e.target.closest('[data-a]');
+    if (!a) return;
+    m.remove();
+    if (a.dataset.a === 'again') startGame(cfg);
+    else if (a.dataset.a === 'misses') startGame(Object.assign({}, cfg, { scope: { label: 'Missed last time', idxs: missed.map((n) => G.pack.byName.get(n)).filter((i) => i != null) } }));
+    else if (a.dataset.a === 'look') {
+      G.setPrompt('Your finished map<small>pinch or scroll to zoom</small>');
+      G.panel.innerHTML = '<div class="panelrow" style="margin:0"><span class="grow"></span><button class="btn primary" data-a="done">Done</button></div>';
+      G.panel.onclick = (ev) => { if (ev.target.closest('[data-a]')) { closeGame(); route(currentHash()); } };
+      G.mv.fitHome(true);
+      G.looking = true;
+    } else { closeGame(); route(currentHash()); }
+  });
+  document.body.appendChild(m);
+  beep('done');
+}
+</script>

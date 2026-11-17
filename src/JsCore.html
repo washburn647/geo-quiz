@@ -1,0 +1,270 @@
+<script>
+// ---------- basics ----------
+const $ = (s, r) => (r || document).querySelector(s);
+const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+const shuffle = (a) => { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const pct = (x) => Math.round(x * 100) + '%';
+function fmtSecs(s) { s = Math.round(s); const m = Math.floor(s / 60); return m >= 60 ? Math.floor(m / 60) + 'h ' + (m % 60) + 'm' : m + ':' + String(s % 60).padStart(2, '0'); }
+function fmtAgo(ms) {
+  if (!ms) return 'never';
+  const d = (Date.now() - ms) / 864e5;
+  if (d < 1 / 24) return 'just now';
+  if (d < 1) return Math.round(d * 24) + 'h ago';
+  if (d < 2) return 'yesterday';
+  if (d < 30) return Math.round(d) + ' days ago';
+  return new Date(ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+}
+function toast(msg, ms) {
+  const t = document.createElement('div');
+  t.className = 'toast'; t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), ms || 2200);
+}
+
+// ---------- storage (per device; the spreadsheet is the real record) ----------
+const store = {
+  get(k, d) { try { const v = localStorage.getItem('gq:' + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem('gq:' + k, JSON.stringify(v)); return true; } catch (e) { return false; } },
+  del(k) { try { localStorage.removeItem('gq:' + k); } catch (e) { /* ignore */ } },
+  keys() { try { return Object.keys(localStorage).filter((k) => k.startsWith('gq:')).map((k) => k.slice(3)); } catch (e) { return []; } },
+};
+
+// ---------- server ----------
+function api(fn, ...args) {
+  return new Promise((res, rej) => {
+    if (!(window.google && google.script && google.script.run)) return rej(new Error('offline'));
+    google.script.run.withSuccessHandler(res).withFailureHandler(rej)[fn](...args);
+  });
+}
+
+// ---------- app state ----------
+const S = {
+  build: BOOT.build,
+  catalog: BOOT.catalog,
+  progress: BOOT.progress || { maps: {}, days: {}, recent: [], totals: { plays: 0, secs: 0 } },
+  settings: Object.assign({ pins: ['us-vt-towns', 'us-vt-counties'], sound: true }, BOOT.settings || {}),
+  mapProg: {},
+};
+function saveSettings() { api('saveSettings', S.settings).catch(() => {}); }
+
+// ---------- map packs ----------
+const packCache = {};
+async function loadPack(id) {
+  if (packCache[id]) return packCache[id];
+  const key = 'map:' + id;
+  const cached = store.get(key);
+  let txt = cached && cached.b === S.build ? cached.t : null;
+  if (!txt) {
+    txt = await api('getMap', id);
+    if (!store.set(key, { b: S.build, t: txt })) {
+      store.keys().filter((k) => k.startsWith('map:')).forEach((k) => store.del(k));
+      store.set(key, { b: S.build, t: txt });
+    }
+  }
+  const p = JSON.parse(await unpackMap(txt));
+  prepPack(p);
+  return (packCache[id] = p);
+}
+
+// Map files are stored gzipped + base64 (see build/pack-src.mjs); older ones were plain JSON.
+async function unpackMap(txt) {
+  if (txt[0] === '{') return txt;
+  const bin = Uint8Array.from(atob(txt), (ch) => ch.charCodeAt(0));
+  const stream = new Blob([bin]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Response(stream).text();
+}
+
+function prepPack(p) {
+  p.byKey = new Map();
+  p.places.forEach((pl, i) => {
+    pl.i = i;
+    pl.keys = Array.from(new Set([pl.n].concat(pl.alt || []).map(norm).filter(Boolean)));
+    pl.key = norm(pl.n);
+    pl.adj = Array.from(new Set(pl.nb.concat(pl.nr)));
+    pl.keys.forEach((k) => { if (!p.byKey.has(k)) p.byKey.set(k, []); p.byKey.get(k).push(i); });
+  });
+  p.groupMembers = p.groups.map((_, g) => p.places.filter((pl) => pl.g === g).map((pl) => pl.i));
+  p.byName = new Map(p.places.map((pl) => [pl.n, pl.i]));
+}
+
+function packInfo(id) { return S.catalog.packs[id] || { title: id, count: 0, nouns: 'places', noun: 'place' }; }
+function fullTitle(id) {
+  const info = packInfo(id);
+  return info.title + ' — ' + info.nouns;
+}
+
+// ---------- progress ----------
+const LEVELS = ['Easy', 'Medium', 'Hard', 'Blind'];
+const DUE_DAYS = [0, 1, 2, 4, 8, 16];
+
+async function loadProgress(id) {
+  if (S.mapProg[id]) return S.mapProg[id];
+  const cached = store.get('prog:' + id);
+  if (cached) S.mapProg[id] = cached;
+  const fresh = api('getMapProgress', id).then((pr) => { S.mapProg[id] = pr; store.set('prog:' + id, pr); return pr; });
+  if (cached) { fresh.catch(() => {}); return cached; }
+  try { return await fresh; } catch (e) { return (S.mapProg[id] = { places: {}, runs: [] }); }
+}
+// level 0-5, or -1 if never asked
+function lvlOf(prog, name) { const r = prog && prog.places[name]; return r ? r[0] : -1; }
+function isDue(prog, name) {
+  const r = prog && prog.places[name];
+  if (!r) return true;
+  return Date.now() - r[5] > DUE_DAYS[Math.floor(r[0])] * 864e5;
+}
+function mastery(id) {
+  const m = S.progress.maps[id];
+  const n = packInfo(id).count || 1;
+  return m ? { pct: m.lvl / (5 * n), known: m.known, seen: m.seen, plays: m.plays, last: m.last, secs: m.secs } : { pct: 0, known: 0, seen: 0, plays: 0, last: 0, secs: 0 };
+}
+// Same rule as nextLevel_ in Store.js.
+function nextLevel(lvl, credit) { return Math.round((credit > 0 ? Math.min(5, lvl + 0.5 * credit) : Math.max(0, lvl - 1.5)) * 100) / 100; }
+// Same rules as Store.saveRun, applied right away so the screens update before the sheet answers.
+function applyLocally(run) {
+  const prog = S.mapProg[run.mapId] || (S.mapProg[run.mapId] = { places: {}, runs: [] });
+  const m = S.progress.maps[run.mapId] || (S.progress.maps[run.mapId] = { plays: 0, secs: 0, last: 0, best: {}, lvl: 0, seen: 0, known: 0 });
+  const now = Date.now();
+  run.results.forEach(([name, credit, secs]) => {
+    const ok = credit > 0;
+    const r = prog.places[name] || [0, 0, 0, 0, 0, now, 0];
+    if (!prog.places[name]) { m.seen++; }
+    const before = r[0];
+    r[0] = nextLevel(r[0], credit);
+    r[1]++; r[2] += ok ? 1 : 0; r[3] += ok ? 0 : 1; r[4] = credit >= 1 ? r[4] + 1 : ok ? r[4] : 0; r[5] = now;
+    r[6] = secs ? Math.round((r[6] * (r[1] - 1) + secs) / r[1] * 10) / 10 : r[6];
+    prog.places[name] = r;
+    m.lvl += r[0] - before;
+    if (before < 3 && r[0] >= 3) m.known++;
+    if (before >= 3 && r[0] < 3) m.known--;
+  });
+  const acc = run.q ? run.right / run.q : 0;
+  prog.runs.push([now, run.modeName, run.level, run.scope, run.q, run.right, acc, run.secs, run.score, run.missed.join(', ')]);
+  m.plays++; m.secs += run.secs; m.last = now;
+  const key = run.modeName + '|' + run.level + '|' + run.scope;
+  const b = m.best[key];
+  const pb = !b || run.score > b[0] || (run.score === b[0] && run.secs < b[1]);
+  if (pb) m.best[key] = [run.score, run.secs, acc];
+  const day = new Date().toLocaleDateString('en-CA');
+  S.progress.days[day] = (S.progress.days[day] || 0) + 1;
+  S.progress.totals.plays++; S.progress.totals.secs += run.secs;
+  S.progress.recent.unshift([now, run.mapId, run.modeName, run.level, acc, run.score, run.scope]);
+  store.set('prog:' + run.mapId, prog);
+  return { pb: pb && !!b, first: !b };
+}
+// Games are queued on the device and sent to the sheet; failures are retried next time.
+function queueRun(run) {
+  const q = store.get('pending', []);
+  q.push(run);
+  store.set('pending', q);
+  return (flushing || Promise.resolve()).then(() => flushRuns());
+}
+let flushing = null;
+function flushRuns() {
+  if (!flushing) flushing = sendPending().finally(() => { flushing = null; });
+  return flushing;
+}
+async function sendPending() {
+  let q = store.get('pending', []);
+  while (q.length) {
+    try {
+      const res = await api('saveRun', q[0]);
+      if (res && res.progress) { S.mapProg[q[0].mapId] = res.progress; store.set('prog:' + q[0].mapId, res.progress); }
+    } catch (e) { break; }
+    q = store.get('pending', []).slice(1);
+    store.set('pending', q);
+  }
+  return q.length;
+}
+function dayStreak() {
+  const days = S.progress.days || {};
+  let n = 0;
+  const d = new Date();
+  if (!days[d.toLocaleDateString('en-CA')]) d.setDate(d.getDate() - 1);
+  while (days[d.toLocaleDateString('en-CA')]) { n++; d.setDate(d.getDate() - 1); }
+  return n;
+}
+
+// ---------- names ----------
+const FOLD = { 'ı': 'i', 'ł': 'l', 'ø': 'o', 'æ': 'ae', 'œ': 'oe', 'ß': 'ss', 'đ': 'd', 'ð': 'd', 'þ': 'th', 'ħ': 'h' };
+function norm(s) {
+  return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/[ıłøæœßđðþħ]/g, (c) => FOLD[c]).replace(/&/g, ' and ').replace(/['’‘`.ʻ]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ').trim()
+    .replace(/\bsaint\b/g, 'st').replace(/\bsainte\b/g, 'ste').replace(/\bmount\b/g, 'mt').replace(/\bfort\b/g, 'ft').replace(/^the /, '');
+}
+function lev(a, b, max) {
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    let best = i;
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      best = Math.min(best, cur[j]);
+    }
+    if (best > max) return max + 1;
+    prev = cur;
+  }
+  return prev[b.length];
+}
+// Is `input` the name of place t? Small typos pass unless they spell another place better.
+function judge(pack, input, t) {
+  const k = norm(input);
+  if (!k) return { empty: true };
+  const T = pack.places[t];
+  if (T.keys.includes(k)) return { ok: true };
+  const exact = pack.byKey.get(k);
+  if (exact && !exact.includes(t)) return { ok: false, other: exact[0] };
+  const allow = k.length <= 4 ? 0 : k.length <= 8 ? 1 : 2;
+  const dT = Math.min(...T.keys.map((key) => lev(k, key, allow)));
+  if (dT > allow) return { ok: false };
+  for (const pl of pack.places) {
+    if (pl.i === t) continue;
+    for (const key of pl.keys) if (lev(k, key, dT) < dT) return { ok: false, other: pl.i };
+  }
+  return { ok: true, typo: true };
+}
+
+// ---------- sound ----------
+let actx = null;
+function beep(kind) {
+  if (!S.settings.sound) return;
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    const t = actx.currentTime;
+    const f = { ok: [660, 990], bad: [220, 160], done: [523, 784] }[kind] || [440, 440];
+    o.frequency.setValueAtTime(f[0], t); o.frequency.exponentialRampToValueAtTime(f[1], t + 0.12);
+    o.type = kind === 'bad' ? 'square' : 'sine';
+    g.gain.setValueAtTime(kind === 'bad' ? 0.04 : 0.08, t); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
+    o.connect(g); g.connect(actx.destination); o.start(t); o.stop(t + 0.23);
+  } catch (e) { /* no audio */ }
+}
+
+// ---------- routing (google.script.history inside Apps Script; location.hash in a plain browser) ----------
+const gsh = () => window.google && google.script && google.script.history;
+function go(hash, replace) {
+  hash = hash.replace(/^#/, '');
+  if (gsh()) { google.script.history[replace ? 'replace' : 'push'](null, null, hash); route(hash); }
+  else if (replace) { history.replaceState(null, '', '#' + hash); route(hash); }
+  else location.hash = hash;
+}
+function startRouter() {
+  document.addEventListener('click', (e) => {
+    const a = e.target.closest('a[href^="#"]');
+    if (!a) return;
+    e.preventDefault();
+    go(a.getAttribute('href'));
+  });
+  if (gsh()) {
+    google.script.history.setChangeHandler((e) => route(e.location.hash || ''));
+    google.script.url.getLocation((loc) => route(loc.hash || ''));
+  } else {
+    window.addEventListener('hashchange', () => route(location.hash.slice(1)));
+    route(location.hash.slice(1));
+  }
+}
+</script>

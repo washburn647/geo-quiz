@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<?!= include('Styles'); ?>
+</head>
+<body>
+<div id="app"></div>
+<script>var BOOT = <?!= boot ?>;</script>
+<?!= include('JsCore'); ?>
+<?!= include('JsMap'); ?>
+<?!= include('JsGames'); ?>
+<?!= include('JsScreens'); ?>
+<script>
+startRouter();
+flushRuns();
+</script>
+</body>
+</html>
