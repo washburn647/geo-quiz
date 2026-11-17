@@ -3,8 +3,10 @@
 //   opt.onTap(i, event)   i = place index or -1
 //   opt.static            no panning or zooming (thumbnails)
 //   opt.buttons           show + / − / fit buttons
-// Road packs (pack.kind === 'roads') draw places as lines over the state's towns, with a
-// wide invisible stroke to tap or drop on, labels that slide along the road, and town names.
+// Line packs (pack.kind 'roads' or 'rivers') draw places as lines over the state's towns, with a
+// wide invisible stroke to tap or drop on, labels that slide along the line, and town names.
+// Spot packs (pack.kind 'points': cities, peaks, lakes) draw places as dots, or small shapes,
+// over the same town map, with names set beside the dots wherever there is room.
 function MapView(host, pack, opt) {
   opt = opt || {};
   const P = pack.places;
@@ -14,8 +16,9 @@ function MapView(host, pack, opt) {
   host.className = 'mvhost';
   outer.appendChild(host);
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  const ROADS = pack.kind === 'roads';
-  svg.setAttribute('class', ROADS ? 'mv roads' : 'mv');
+  const ROADS = pack.kind === 'roads' || pack.kind === 'rivers';
+  const SPOTS = pack.kind === 'points';
+  svg.setAttribute('class', ROADS ? 'mv roads' + (pack.kind === 'rivers' ? ' rivers' : '') : SPOTS ? 'mv spots ' + (pack.sub || '') : 'mv');
   svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
   let html = '<rect x="-50000" y="-50000" width="110000" height="110000" fill="transparent"/>';
   html += '<g class="ctx">' + pack.ctx.map((c) => '<path d="' + c.d + '"/>').join('') + '</g>';
@@ -25,6 +28,9 @@ function MapView(host, pack, opt) {
     html += '<g class="hit">' + P.map((p, i) => '<path d="' + p.d + '" data-i="' + i + '"/>').join('') + '</g>';
     html += '<g class="tw">' + (pack.towns || []).map((t, j) => '<circle cx="' + t.lx + '" cy="' + t.ly + '" r="30" data-t="' + j + '" style="display:none"/>').join('')
       + (pack.towns || []).map((t, j) => '<text x="' + t.lx + '" y="' + t.ly + '" data-t="' + j + '" style="display:none">' + esc(t.n) + '</text>').join('') + '</g>';
+  } else if (SPOTS) {
+    html += '<path class="base" d="' + (pack.base || '') + '"/><path class="lakes" d="' + (pack.lakes || '') + '"/><path class="bgriv" d="' + (pack.rivers || '') + '"/><path class="stline" d="' + (pack.outline || '') + '"/>';
+    html += '<g class="pl">' + P.map((p, i) => '<path class="' + (p.s ? 's' : 'pt') + '" d="' + p.d + '" data-i="' + i + '"/>').join('') + '</g>';
   } else {
     html += '<g class="pl">' + P.map((p, i) => '<path d="' + p.d + '" data-i="' + i + '"/>').join('') + '</g>';
     html += '<path class="lakes" d="' + (pack.lakes || '') + '"/>';
@@ -71,7 +77,7 @@ function MapView(host, pack, opt) {
     v.h = ch * u;
     svg.setAttribute('viewBox', v.x + ' ' + v.y + ' ' + v.w + ' ' + v.h);
     svg.style.setProperty('--u', u);
-    const r = u * 7;
+    const r = u * (SPOTS ? 5.5 : 7);
     for (const k in marks) marks[k].setAttribute('r', r);
     tdots.forEach((c) => c.setAttribute('r', u * (c.classList.contains('big') ? 7 : 3.2)));
     scheduleCull();
@@ -82,6 +88,7 @@ function MapView(host, pack, opt) {
   function cull() {
     const vx1 = v.x + v.w, vy1 = v.y + v.h;
     if (ROADS) { cullRoads(vx1, vy1); return; }
+    if (SPOTS) { cullSpots(vx1, vy1); return; }
     for (let i = 0; i < P.length; i++) {
       const st = lab[i], t = texts[i];
       let show = false;
@@ -100,6 +107,39 @@ function MapView(host, pack, opt) {
       const want = show ? '' : 'none';
       if (t.style.display !== want) t.style.display = want;
     }
+    ctexts.forEach((t, j) => {
+      const c = ctxLabeled[j];
+      const show = showCtx && Math.sqrt(c.a) / u > c.n.length * 7.5 && c.lx > v.x && c.lx < vx1 && c.ly > v.y && c.ly < vy1;
+      const want = show ? '' : 'none';
+      if (t.style.display !== want) t.style.display = want;
+    });
+  }
+
+  // Spot labels: the most important first (always-on, then rank), each above its dot, or below it,
+  // or (for a shape big enough) on it; a name that would cover another waits until you zoom in.
+  function cullSpots(vx1, vy1) {
+    const boxes = [];
+    const free = (x, y, w, h) => !boxes.some((b) => x < b[0] + b[2] && b[0] < x + w && y < b[1] + b[3] && b[1] < y + h);
+    const order = [];
+    for (let i = 0; i < P.length; i++) if (lab[i] && P[i].lx > v.x && P[i].lx < vx1 && P[i].ly > v.y && P[i].ly < vy1) order.push(i);
+    order.sort((a, b) => (lab[b] === 2) - (lab[a] === 2) || (lab[a] === 3) - (lab[b] === 3) || P[b].a - P[a].a);
+    const shown = new Set();
+    for (const i of order) {
+      const p = P[i], t = texts[i];
+      const tw = (labText[i] || p.n).length * (lab[i] === 2 ? 7.4 : 6.5) + 6, th = 15;
+      const sx = (p.lx - v.x) / u, sy = (p.ly - v.y) / u;
+      const onShape = !p.m && (p.bb[2] - p.bb[0]) / u > tw && (p.bb[3] - p.bb[1]) / u > th * 1.6;
+      const tries = onShape ? [0] : [-14, 14];
+      for (const dy of tries) {
+        if (lab[i] === 2 || free(sx - tw / 2, sy + dy - th / 2, tw, th)) {
+          boxes.push([sx - tw / 2, sy + dy - th / 2, tw, th]);
+          t.setAttribute('y', p.ly + dy * u);
+          shown.add(i);
+          break;
+        }
+      }
+    }
+    texts.forEach((t, i) => { const want = shown.has(i) ? '' : 'none'; if (t.style.display !== want) t.style.display = want; });
     ctexts.forEach((t, j) => {
       const c = ctxLabeled[j];
       const show = showCtx && Math.sqrt(c.a) / u > c.n.length * 7.5 && c.lx > v.x && c.lx < vx1 && c.ly > v.y && c.ly < vy1;

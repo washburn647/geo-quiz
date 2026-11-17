@@ -7,7 +7,7 @@ const MODES = [
   { id: 'type', e: '⌨️', n: 'Name It', d: 'Type the highlighted place’s name.' },
   { id: 'wheel', e: '🎡', n: 'Name Wheel', d: 'Flip through names to the right one.' },
   { id: 'all', e: '🧠', n: 'Name ’em All', d: 'Type every one you can remember.' },
-  { id: 'border', e: '🧭', n: 'Border Patrol', d: 'Pick out every neighbor.' },
+  { id: 'border', e: '🧭', n: 'Border Patrol', d: 'Pick out every neighbor.', kinds: ['area', 'roads', 'rivers'] },
   { id: 'trip', e: '🚗', n: 'Road Trip', d: 'Pick the roads from one town to another.', kinds: ['roads'] },
   { id: 'shape', e: '🧩', n: 'Shape Shifter', d: 'Name it from its outline alone.', kinds: ['area'] },
   { id: 'blitz', e: '⚡', n: 'Blitz', d: 'Find all you can before time runs out.' },
@@ -90,7 +90,7 @@ function makeGame(cfg, pack, prog, root) {
   // Hint on the map: first the county/region (or neighbourhood) it's in, then the place itself.
   G.mapHint = (t, n) => {
     const p = G.P[t];
-    if (G.pack.kind === 'roads') {
+    if (G.pack.kind === 'roads' || G.pack.kind === 'rivers') {
       if (n === 1) {
         const through = (G.pack.towns || []).map((tn, j) => [tn, j]).filter(([tn]) => tn.r.includes(t)).slice(0, 3);
         if (!through.length) { toast('No towns listed along this one', 1600); return; }
@@ -101,6 +101,14 @@ function makeGame(cfg, pack, prog, root) {
       return;
     }
     const grouped = p.g != null && G.pack.groups.length > 1;
+    if (n === 1 && G.pack.kind === 'points') {
+      // a window a few miles across with the place somewhere in it (not in the middle), and its town when known
+      const w = (p.bb[2] - p.bb[0]) * 1.6, ox = (Math.random() - 0.5) * w, oy = (Math.random() - 0.5) * w;
+      const cx = (p.bb[0] + p.bb[2]) / 2 + ox, cy = (p.bb[1] + p.bb[3]) / 2 + oy;
+      G.mv.fit([cx - w, cy - w, cx + w, cy + w], true, 10);
+      toast(p.t ? 'It’s in ' + p.t : grouped && G.pack.groupNoun === 'County' ? 'It’s in ' + G.pack.groups[p.g] + ' County' : 'It’s somewhere in this view', 2400);
+      return;
+    }
     if (n === 1) {
       const area = grouped ? G.pack.groupMembers[p.g] : [t].concat(p.nb);
       area.forEach((j) => G.mv.flash(j, 'sel', 2600));
@@ -205,8 +213,10 @@ function modeStudy(G) {
   const info = (i) => {
     const p = G.P[i];
     const l = lvlOf(G.prog, p.n);
-    const through = G.pack.kind === 'roads' ? (G.pack.towns || []).filter((tn) => tn.r.includes(i)).slice(0, 4).map((tn) => tn.n) : [];
-    return p.n + (through.length ? ' · ' + through.join(', ') : G.pack.groups.length && p.g != null ? ' · ' + G.pack.groups[p.g] : '') + (l >= 0 ? ' · level ' + Math.floor(l) + '/5' : '');
+    const through = (G.pack.kind === 'roads' || G.pack.kind === 'rivers') ? (G.pack.towns || []).filter((tn) => tn.r.includes(i)).slice(0, 4).map((tn) => tn.n) : [];
+    const fact = p.ft ? ' · about ' + p.ft.toLocaleString() + ' ft' : p.km ? ' · ' + Math.round(p.km * 0.621) + ' mi in ' + G.pack.title : p.km2 ? ' · ' + (p.km2 >= 2.6 ? Math.round(p.km2 * 0.386 * 10) / 10 + ' sq mi' : Math.round(p.km2 * 247.1).toLocaleString() + ' acres') : '';
+    const where = p.t ? ' · in ' + p.t : '';
+    return p.n + fact + where + (through.length ? ' · ' + through.join(', ') : G.pack.groups.length && p.g != null && !(p.t && G.pack.groupNoun !== 'County') ? ' · ' + G.pack.groups[p.g] + (p.t && G.pack.groupNoun === 'County' ? ' County' : '') : '') + (l >= 0 ? ' · level ' + Math.floor(l) + '/5' : '');
   };
   G.onTap = (i) => {
     if (i < 0) return;
@@ -508,7 +518,7 @@ function modeAll(G) {
   });
   targets.forEach((i) => G.mv.cls(i, 'blank'));
   G.mv.ctxLabels(!G.blind);
-  if (G.blind) { if (G.pack.kind === 'roads') G.mv.hideRoads(true); else { G.mv.borders(false); G.mv.groupLines(false); } }
+  if (G.blind) { if (G.pack.kind === 'roads' || G.pack.kind === 'rivers') G.mv.hideRoads(true); else { G.mv.borders(false); G.mv.groupLines(false); } }
   const limit = G.lvl >= 2 ? Math.max(60, Math.round(n * (G.lvl === 2 ? 9 : 7))) : 0;
   G.setPrompt('Name every ' + esc(G.noun) + ' you can<small>' + esc(G.cfg.scope.label) + ' · any order</small>');
   G.panel.innerHTML = '<form class="answer"><input autocomplete="off" autocapitalize="words" autocorrect="off" spellcheck="false" placeholder="Type a name…"><button class="btn" type="button" data-a="give">I’m done</button></form><div class="hintline"></div>';
@@ -572,7 +582,7 @@ function modeBorder(G) {
     if (decoys.length < nDecoy) decoys = decoys.concat(nearestPlaces(G, t, nDecoy * 2).filter((x) => !nb.includes(x) && !decoys.includes(x)).slice(0, nDecoy - decoys.length));
     opts = shuffle(nb.concat(decoys));
     if (!G.blind) { G.mv.cls(t, 'tgt'); G.mv.fit(G.mv.bboxOf([t].concat(nb)), true, 40); } else G.mv.fitHome(true);
-    G.setPrompt('Which ' + esc(G.nouns) + (G.pack.kind === 'roads' ? ' meet' : ' border') + ' <b>' + esc(G.P[t].n) + '</b>?<small>' + (G.lvl < 2 ? nb.length + ' to find' : 'Pick all that apply') + '</small>');
+    G.setPrompt('Which ' + esc(G.nouns) + ((G.pack.kind === 'roads' || G.pack.kind === 'rivers') ? ' meet' : ' border') + ' <b>' + esc(G.P[t].n) + '</b>?<small>' + (G.lvl < 2 ? nb.length + ' to find' : 'Pick all that apply') + '</small>');
     G.setMeter('<b>' + r + '</b>/' + rounds.length);
     render();
   }

@@ -673,8 +673,10 @@ async function buildRoadPack(cfg) {
   if (!STATE_NAMES_BY_AB) STATE_NAMES_BY_AB = Object.fromEntries(Object.entries(STATE_ABBR).map(([f, a]) => [a, STATE_NAMES[f]]));
   const stateF = US_STATES.find((f) => f.id === fips);
   // 1. group segments into routes
+  const RIV = cfg.kind === 'rivers';
   const routes = new Map();
-  for (const f of await readRoads(fips)) {
+  if (RIV) for (const r of riverRoutes(cfg)) routes.set(r.key, r);
+  else for (const f of await readRoads(fips)) {
     const r = routeOf(f.properties, ab);
     if (!r || !f.geometry) continue;
     if (!routes.has(r.key)) routes.set(r.key, { ...r, lines: [] });
@@ -716,6 +718,11 @@ async function buildRoadPack(cfg) {
   }
   // keep the 90 longest; major = interstates, US routes and the longest state routes
   R.sort((a, b) => b.len - a.len);
+  if (RIV) {
+    // rivers: every one long enough, in three sets by length inside the state
+    R.forEach((r) => { r.g = r.km >= 40 ? 0 : r.km >= 20 ? 1 : 2; });
+    R.sort((a, b) => a.g - b.g || b.km - a.km);
+  } else {
   R = R.slice(0, 90);
   const nMajor = Math.max(10, Math.round(R.length * 0.35));
   let stateRank = 0;
@@ -723,9 +730,10 @@ async function buildRoadPack(cfg) {
   R.forEach((r) => { r.g = r.type !== 'S' ? 0 : (stateRank++ < nMajor - nIU ? 0 : 1); });
   const order = { I: 0, U: 1, S: 2 };
   R.sort((a, b) => order[a.type] - order[b.type] || parseInt(a.num, 10) - parseInt(b.num, 10) || a.num.localeCompare(b.num));
+  }
 
   // 3. which routes meet (within ~600 m: a junction in a village is often filed under its street name)
-  const tol = Math.max(10, 600 / mPerUnit), cell = tol * 2;
+  const tol = Math.max(RIV ? 6 : 10, (RIV ? 300 : 600) / mPerUnit), cell = tol * 2;
   const grid = new Map();
   R.forEach((r, i) => r.dense.forEach(([x, y]) => {
     const k = Math.floor(x / cell) + ',' + Math.floor(y / cell);
@@ -774,7 +782,7 @@ async function buildRoadPack(cfg) {
         if (r.bb[2] < info.bb[0] || r.bb[0] > info.bb[2] || r.bb[3] < info.bb[1] || r.bb[1] > info.bb[3]) return;
         if (r.dense.some((p) => p[0] >= info.bb[0] && p[0] <= info.bb[2] && p[1] >= info.bb[1] && p[1] <= info.bb[3] && rs.some((ring) => pointInRing(p, ring)))) inside.add(i);
       });
-      towns.push({ n: townName(f.properties, props), lx: info.lx, ly: info.ly, a: info.a, r: Array.from(inside) });
+      towns.push({ n: townName(f.properties, props), lx: info.lx, ly: info.ly, a: info.a, r: Array.from(inside), co: f.properties.NAMELSADCO.replace(/ County$/, '') });
     }
   } else {
     const st = STATE_NAMES[fips];
@@ -809,20 +817,233 @@ async function buildRoadPack(cfg) {
     if (rt.length) { const info = shapeInfo(rt); if (info.a > (W * 0.03) ** 2) { o.n = c.name; o.lx = info.lx; o.ly = info.ly; o.a = info.a; } }
     ctxOut.push(o);
   }
-  const { topo: lt, obj: lo } = await simplifyTopo(LAKES().map((f) => feat(f.geometry, {})), interval * 1.5, false);
-  const lakes = encode(cleanRings(rings(gp, topojson.feature(lt, lo)), (W * 0.004) ** 2).filter((r) => Math.abs(ringArea(r)) < W * H * 0.3), true);
-
-  const groups = R.some((r) => r.g === 1) ? ['Major roads', 'Other state routes'] : ['Major roads'];
+  let lakes;
+  if (RIV) lakes = await fineLakes(ab, gp, interval, H);
+  else {
+    const { topo: lt, obj: lo } = await simplifyTopo(LAKES().map((f) => feat(f.geometry, {})), interval * 1.5, false);
+    lakes = encode(cleanRings(rings(gp, topojson.feature(lt, lo)), (W * 0.004) ** 2).filter((r) => Math.abs(ringArea(r)) < W * H * 0.3), true);
+  }
+  if (RIV) {
+    // same name twice (two Black Rivers): add the county most of it runs through
+    const cnt = {};
+    R.forEach((r) => { cnt[r.name] = (cnt[r.name] || 0) + 1; });
+    R.forEach((r, i) => {
+      if (cnt[r.name] < 2) return;
+      const by = {};
+      towns.forEach((t) => { if (t.r.includes(i) && t.co) by[t.co] = (by[t.co] || 0) + 1; });
+      const co = Object.entries(by).sort((a, b) => b[1] - a[1])[0];
+      if (co) { r.alt = uniq([...(r.alt || []), r.name]); r.name = r.name + ' (' + co[0] + ')'; }
+    });
+    // still twins inside one county: name the town instead
+    const cnt2 = {};
+    R.forEach((r) => { cnt2[r.name] = (cnt2[r.name] || 0) + 1; });
+    R.forEach((r, i) => {
+      if (cnt2[r.name] < 2) return;
+      const [mx, my] = [r.lx, r.ly];
+      const tn = towns.filter((t) => t.r.includes(i)).sort((a, b) => Math.hypot(a.lx - mx, a.ly - my) - Math.hypot(b.lx - mx, b.ly - my))[0];
+      if (tn) r.name = r.name.replace(/ \([^)]*\)$/, '') + ' (' + tn.n + ')';
+    });
+    const seen = new Set();
+    R.forEach((r) => { if (seen.has(r.name)) console.warn('  ! duplicate name', cfg.id, r.name); seen.add(r.name); });
+  }
+  const groups = RIV ? ['Major rivers', 'Rivers', 'Streams & brooks'].slice(0, Math.max(...R.map((r) => r.g)) + 1)
+    : R.some((r) => r.g === 1) ? ['Major roads', 'Other state routes'] : ['Major roads'];
   const pack = {
-    id: cfg.id, kind: 'roads', title: cfg.title, noun: 'road', nouns: 'roads', groupNoun: 'Set', w: W, h: H, groups,
-    places: R.map((r, i) => ({ n: r.name, alt: r.alt, d: encode(r.pieces, false), lx: r.lx, ly: r.ly, a: Math.round(r.len), bb: r.bb, nb: Array.from(nb[i]).sort((a, b) => a - b), nr: [], g: r.g })),
+    id: cfg.id, kind: cfg.kind, title: cfg.title, noun: cfg.noun, nouns: cfg.nouns, groupNoun: 'Set', w: W, h: H, groups,
+    places: R.map((r, i) => ({ n: r.name, alt: r.alt, d: encode(r.pieces, false), lx: r.lx, ly: r.ly, a: Math.round(r.len), bb: r.bb, nb: Array.from(nb[i]).sort((a, b) => a - b), nr: [], g: r.g, ...(RIV ? { km: Math.round(r.km) } : {}) })),
     towns: towns.sort((a, b) => b.a - a.a).map((t) => ({ n: t.n, lx: t.lx, ly: t.ly, r: t.r })),
     base: encode(basePolys, true), outline: encode(stOutline, true), ctx: ctxOut, lakes, lines: '',
   };
   const json = JSON.stringify(pack);
   fs.writeFileSync(path.join(OUT, cfg.id + '.json'), json);
-  console.log(`${cfg.id.padEnd(22)} ${String(R.length).padStart(4)} roads ${String(R.filter((r) => r.g === 0).length).padStart(3)} major ${String(towns.length).padStart(4)} towns ${(json.length / 1024).toFixed(0).padStart(5)} KB  ${towns.filter((t) => !t.r.length).length} towns off-road`);
-  return { id: cfg.id, title: cfg.title, count: R.length, noun: 'road', nouns: 'roads', kb: Math.round(json.length / 1024) };
+  console.log(`${cfg.id.padEnd(22)} ${String(R.length).padStart(4)} ${cfg.nouns} ${String(R.filter((r) => r.g === 0).length).padStart(3)} major ${String(towns.length).padStart(4)} towns ${(json.length / 1024).toFixed(0).padStart(5)} KB  ${towns.filter((t) => !t.r.length).length} towns off-road`);
+  return { id: cfg.id, title: cfg.title, count: R.length, noun: cfg.noun, nouns: cfg.nouns, kb: Math.round(json.length / 1024) };
+}
+
+// ---------- physical geography per state: rivers (lines), and cities, peaks, lakes ("spots" on the town map) ----------
+// Sources are the small GeoJSON files in sources/derived, made by build/prep/prep-state.py.
+const DERIVED = path.join(SRC, 'derived');
+const hasDerived = (ab, what) => fs.existsSync(path.join(DERIVED, `us-${ab}-${what}.geojson`));
+const derivedCache = {};
+const derived = (ab, what) => derivedCache[ab + what] || (derivedCache[ab + what] = JSON.parse(fs.readFileSync(path.join(DERIVED, `us-${ab}-${what}.geojson`), 'utf8')).features);
+const shortSaint = (n) => n.replace(/^Saint /, 'St. ').replace(/ Saint /g, ' St. ');
+const RIVER_ALT = { 'Batten Kill': ['Battenkill', 'Battenkill River'] };
+function riverRoutes(cfg) {
+  return derived(cfg.ab, 'rivers').filter((f) => f.properties.km >= (cfg.minKm || 12) && !/^(Ruisseau|Rivière)/.test(f.properties.name)).map((f) => {
+    const nm = f.properties.name;
+    const alt = uniq([...(RIVER_ALT[nm] || []), / River$/.test(nm) ? nm.replace(/ River$/, '') : null, nm.replace(/^(First|Second|Third|North|South|East|West|Middle) Branch (.*)$/, '$2 $1 Branch') !== nm ? nm.replace(/^(\w+) Branch (.*)$/, '$1 Branch of the $2') : null]);
+    const g = f.geometry;
+    return { key: 'R' + f.properties.gnis_id, type: 'R', num: '', name: nm, alt, km: f.properties.km, lines: g.type === 'LineString' ? [g.coordinates] : g.coordinates };
+  });
+}
+// Lakes drawn behind a state map, from the hydrography extract (finer than Natural Earth's); `skip` leaves out the ones being quizzed.
+async function fineLakes(ab, gp, interval, H, skip) {
+  const fsL = derived(ab, 'lakes').filter((f) => !(skip && skip.has(f.properties.gnis_id)) && f.properties.km2 >= 0.3);
+  const { topo: lt, obj: lo } = await simplifyTopo(fsL.map((f) => feat(f.geometry, {})), interval, false);
+  return encode(cleanRings(rings(gp, topojson.feature(lt, lo)), (W * 0.0015) ** 2).filter((r) => Math.abs(ringArea(r)) < W * H * 0.3), true);
+}
+// Projection and frame for a state, the same fit as its road and town maps.
+function stateFrame(fips) {
+  const stateF = US_STATES.find((f) => f.id === fips);
+  const extentKm = naiveExtentKm([stateF]);
+  const interval = extentKm * 1000 / W * 6;
+  const proj = fips === '02' ? d3.geoAzimuthalEqualArea().rotate([152, -62]) : makeProjection({}, stateF);
+  proj.fitSize([1000, 1000], stateF);
+  const b0 = d3.geoPath(proj).bounds(stateF);
+  const aspect = Math.min(1.5, Math.max(0.55, (b0[1][1] - b0[0][1]) / (b0[1][0] - b0[0][0])));
+  const H = Math.round(W * aspect);
+  const pad = W * 0.02;
+  proj.fitExtent([[pad, pad], [W - pad, H - pad]], stateF);
+  const TIGHT = [[-W * 0.01, -W * 0.01], [W * 1.01, H + W * 0.01]], WIDE = [[-W * 0.3, -W * 0.3], [W * 1.3, H + W * 0.3]];
+  proj.clipExtent(TIGHT);
+  return { stateF, extentKm, interval, proj, gp: d3.geoPath(proj), H, TIGHT, WIDE, mPerUnit: extentKm * 1000 / W };
+}
+
+// A "spots" pack: things to find on the state's town map. Each place is a point (city, village, peak)
+// or a small shape (lake). cfg.make() returns [{ id, name, alt, group, rank, geometry, extra }].
+async function buildSpotPack(cfg) {
+  const { fips, ab } = cfg;
+  const F = stateFrame(fips);
+  const { proj, gp, H, interval } = F;
+  const items = await cfg.make();
+  const pad = W * 0.012;
+  let P = [];
+  for (const it of items) {
+    const g = it.geometry;
+    let o;
+    if (g.type === 'Point') {
+      const xy = proj(g.coordinates);
+      if (!xy) continue;
+      const x = Math.round(xy[0]), y = Math.round(xy[1]);
+      if (x < 0 || x > W || y < 0 || y > H) continue;
+      o = { d: `M${x - 2} ${y - 2}l4 0 0 4-4 0z`, lx: x, ly: y, bb: [x - pad, y - pad, x + pad, y + pad].map(Math.round), m: 1 };
+    } else {
+      const out = await mapshaper.applyCommands(`-i in.json -simplify interval=${Math.round(interval / 3)} keep-shapes -o out.json format=geojson`, { 'in.json': { type: 'FeatureCollection', features: [feat(g, { k: 1 })] } });
+      const sf = JSON.parse(out['out.json']).features[0];
+      proj.clipExtent(F.WIDE);
+      const rs = cleanRings(rings(gp, { type: 'Feature', geometry: rewind(sf.geometry) }), 0).filter((r) => Math.abs(ringArea(r)) < W * H * 0.3);
+      proj.clipExtent(F.TIGHT);
+      if (!rs.length) continue;
+      const info = shapeInfo(rs);
+      const lx = Math.min(W, Math.max(0, info.lx)), ly = Math.min(H, Math.max(0, info.ly));
+      const bb = [Math.min(info.bb[0], lx - pad), Math.min(info.bb[1], ly - pad), Math.max(info.bb[2], lx + pad), Math.max(info.bb[3], ly + pad)].map(Math.round);
+      o = { d: encode(rs, true), lx, ly, bb, shape: 1 };
+      if (Math.max(info.bb[2] - info.bb[0], info.bb[3] - info.bb[1]) < W * 0.02) o.m = 1;
+    }
+    P.push({ ...o, n: it.name, alt: it.alt || [], group: it.group || '', rank: it.rank || 0, where: it.where || '', extra: it.extra || {} });
+  }
+  // unique names: add the town (or county) to twins
+  const cnt = {};
+  P.forEach((p) => { cnt[p.n] = (cnt[p.n] || 0) + 1; });
+  P.forEach((p) => { if (cnt[p.n] > 1 && p.where) { p.alt = uniq([...p.alt, p.n]); p.n = p.n + ' (' + p.where + ')'; } });
+  P.sort((a, b) => b.rank - a.rank);
+  const seen = new Set();
+  P = P.filter((p) => { if (seen.has(p.n)) { console.warn('  ! dropped duplicate', cfg.id, p.n); return false; } seen.add(p.n); return true; });
+  let groups = uniq(P.map((p) => p.group));
+  if (cfg.groupOrder) groups = cfg.groupOrder.filter((g) => groups.includes(g)); else groups.sort();
+  P.sort((a, b) => groups.indexOf(a.group) - groups.indexOf(b.group) || b.rank - a.rank || a.n.localeCompare(b.n));
+
+  // backdrop: town boundaries, the state's outline, neighbours, lakes and the bigger rivers
+  let basePolys = [];
+  if (TOWN_STATES[fips]) {
+    const fs1 = (await readCousub(fips)).filter((f) => f.geometry && !/not defined/i.test(f.properties.NAME));
+    const { topo: tt, obj: to } = await simplifyTopo(fs1.map((f) => feat(f.geometry, { pid: f.properties.GEOID, name: '', alt: '', group: '', role: 'q', lbl: 0 })), interval, true);
+    for (const g of to.geometries.filter((g) => g.type)) basePolys.push(...cleanRings(rings(gp, topojson.feature(tt, g)), 1).filter((r) => Math.abs(ringArea(r)) < W * H * 0.3));
+  } else {
+    US_COUNTIES.filter((f) => f.id.slice(0, 2) === fips && f.geometry).forEach((f) => basePolys.push(...cleanRings(rings(gp, f), 1).filter((r) => Math.abs(ringArea(r)) < W * H * 0.3)));
+  }
+  const stOutline = cleanRings(rings(gp, F.stateF), W * 0.5);
+  let rivers = '';
+  if (hasDerived(ab, 'rivers')) {
+    const big = derived(ab, 'rivers').filter((f) => f.properties.km >= (cfg.riverKm || 30) && !/^(Ruisseau|Rivière)/.test(f.properties.name));
+    const out = await mapshaper.applyCommands(`-i in.json -simplify interval=${Math.round(interval)} keep-shapes -o out.json format=geojson`, { 'in.json': { type: 'FeatureCollection', features: big.map((f, k) => ({ type: 'Feature', properties: { k }, geometry: f.geometry })) } });
+    rivers = encode(JSON.parse(out['out.json']).features.flatMap((f) => cleanLines(rings(gp, f))).filter((l) => lineLen(l) > 3), false);
+  }
+  const lakes = hasDerived(ab, 'lakes') ? await fineLakes(ab, gp, interval, H, cfg.skipLakes) : '';
+  const ctxOut = await stateContext(fips, F);
+
+  const pack = {
+    id: cfg.id, kind: 'points', sub: cfg.sub, title: cfg.title, noun: cfg.noun, nouns: cfg.nouns, groupNoun: cfg.groupNoun || 'County', w: W, h: H, groups,
+    places: P.map((p) => {
+      const o = { n: p.n, d: p.d, lx: p.lx, ly: p.ly, a: p.rank, bb: p.bb, nb: [], nr: [], ...p.extra };
+      if (p.alt.length) o.alt = p.alt;
+      if (groups.length) o.g = groups.indexOf(p.group);
+      if (p.m) o.m = 1;
+      if (p.shape) o.s = 1;
+      return o;
+    }),
+    base: encode(basePolys, true), outline: encode(stOutline, true), ctx: ctxOut, lakes, rivers, lines: '',
+  };
+  const json = JSON.stringify(pack);
+  fs.writeFileSync(path.join(OUT, cfg.id + '.json'), json);
+  console.log(`${cfg.id.padEnd(22)} ${String(P.length).padStart(4)} ${cfg.nouns.padEnd(18)} ${String(groups.length).padStart(3)} groups ${(json.length / 1024).toFixed(0).padStart(5)} KB`);
+}
+// Neighbouring states (and countries) around a state map, drawn wider than the map and named where they show.
+async function stateContext(fips, F) {
+  const { proj, gp, interval, H } = F;
+  proj.clipExtent(F.WIDE);
+  const ctxOut = [];
+  const ctxSrc = usContext(fips);
+  const { topo: ct, obj: co } = await simplifyTopo(ctxSrc.map((c, k) => feat(c.geometry, { pid: 'k' + k, name: '', alt: '', group: '', role: 'c', lbl: 0 })), interval * 1.5, true);
+  const ctxById = new Map(co.geometries.filter((g) => g.type).map((g) => [g.properties.pid, topojson.feature(ct, g)]));
+  for (const [k, c] of ctxSrc.entries()) {
+    const f = ctxById.get('k' + k);
+    if (!f) continue;
+    const rs = cleanRings(rings(gp, f), W * 0.02).filter((q) => Math.abs(ringArea(q)) < W * H * 2);
+    if (!rs.length) continue;
+    const o = { d: encode(rs, true) };
+    proj.clipExtent(F.TIGHT);
+    const rt = cleanRings(rings(gp, f), W * 0.02).filter((q) => Math.abs(ringArea(q)) < W * H * 0.9);
+    proj.clipExtent(F.WIDE);
+    if (rt.length) { const info = shapeInfo(rt); if (info.a > (W * 0.03) ** 2) { o.n = c.name; o.lx = info.lx; o.ly = info.ly; o.a = info.a; } }
+    ctxOut.push(o);
+  }
+  proj.clipExtent(F.TIGHT);
+  return ctxOut;
+}
+
+const TIER_RANK = { city: 4, village: 3, cdp: 2, hamlet: 1 };
+const PLACE_ALT = { 'St. Johnsbury': ['St. J', 'St Johnsbury'] };
+const PEAK_BANDS = [[4000, '4,000-footers'], [3500, '3,500 to 4,000 ft'], [3000, '3,000 to 3,500 ft'], [2500, '2,500 to 3,000 ft'], [0, 'Landmark hills']];
+for (const st of FIFTY) {
+  const ab = STATE_ABBR[st.id], fips = st.id, title = STATE_NAMES[st.id];
+  if (hasDerived(ab, 'rivers')) add({ id: `us-${ab}-rivers`, title, state: fips, kind: 'rivers', fips, ab, noun: 'river', nouns: 'rivers', minKm: 12 });
+  if (hasDerived(ab, 'places')) {
+    const mk = (tiers) => () => derived(ab, 'places').filter((f) => tiers.includes(f.properties.tier)).map((f) => {
+      const p = f.properties, nm = shortSaint(p.name);
+      return { id: p.gnis_id, name: nm, alt: uniq([nm !== p.name ? p.name : null, ...(PLACE_ALT[nm] || [])]), group: p.county, where: p.town && p.town !== p.name ? p.town : p.county, rank: TIER_RANK[p.tier], geometry: f.geometry, extra: { k: p.tier, ...(p.town && p.town !== p.name ? { t: p.town } : {}) } };
+    });
+    add({ id: `us-${ab}-cities`, title, state: fips, kind: 'points', sub: 'city', fips, ab, noun: 'place', nouns: 'cities & villages', make: mk(['city', 'village', 'cdp']) });
+    add({ id: `us-${ab}-hamlets`, title, state: fips, kind: 'points', sub: 'hamlet', fips, ab, noun: 'place', nouns: 'hamlets & corners', make: mk(['hamlet']) });
+  }
+  if (hasDerived(ab, 'summits')) add({
+    id: `us-${ab}-peaks`, title, state: fips, kind: 'points', sub: 'peak', fips, ab, noun: 'peak', nouns: 'mountains', groupNoun: 'Height', groupOrder: PEAK_BANDS.map((b) => b[1]),
+    make() {
+      // highest first; a summit within 1.2 km of a higher one already kept is a shoulder of it (The Chin, The Nose)
+      const all = derived(ab, 'summits').filter((f) => f.properties.ft).sort((a, b) => b.properties.ft - a.properties.ft || /^The /.test(a.properties.name) - /^The /.test(b.properties.name) || a.properties.name.localeCompare(b.properties.name));
+      const kept = [];
+      for (const f of all) {
+        const p = f.properties, [x, y] = f.geometry.coordinates;
+        if (p.ft < 2500 && p.iso_km < 6) continue;
+        if (/^(The Nose|The Forehead|The Chin|Adams Apple)$/.test(p.name)) continue; // parts of Mount Mansfield
+        if (kept.some((k) => Math.hypot((k.geometry.coordinates[0] - x) * 79, (k.geometry.coordinates[1] - y) * 111) < 1.2)) continue;
+        kept.push(f);
+      }
+      return kept.map((f) => {
+        const p = f.properties, nm = p.name;
+        const alt = uniq([/^Mount /.test(nm) ? nm.replace(/^Mount /, 'Mt. ') : null, /^Mount /.test(nm) ? nm.replace(/^Mount /, '') : null, / (Mountain|Peak)$/.test(nm) ? nm.replace(/ (Mountain|Peak)$/, '') : null, nm === 'Camels Hump' ? "Camel's Hump" : null]);
+        return { id: p.gnis_id, name: nm, alt, group: PEAK_BANDS.find((b) => p.ft >= b[0])[1], where: p.town || p.county, rank: p.ft, geometry: f.geometry, extra: { ft: p.ft, ...(p.town ? { t: p.town } : {}) } };
+      });
+    },
+  });
+  if (hasDerived(ab, 'lakes')) {
+    const quiz = derived(ab, 'lakes').filter((f) => f.properties.name && f.properties.instate && f.properties.km2 >= 0.4);
+    add({
+      id: `us-${ab}-lakes`, title, state: fips, kind: 'points', sub: 'lake', fips, ab, noun: 'lake', nouns: 'lakes & ponds', groupNoun: 'Size', groupOrder: ['Largest lakes', 'Lakes & ponds'],
+      skipLakes: new Set(quiz.map((f) => f.properties.gnis_id)), riverKm: 40,
+      make: () => quiz.map((f) => ({ id: f.properties.gnis_id, name: shortSaint(f.properties.name), alt: uniq([shortSaint(f.properties.name) !== f.properties.name ? f.properties.name : null, /^Lake /.test(f.properties.name) ? f.properties.name.replace(/^Lake /, '') : null, / (Lake|Pond|Reservoir)$/.test(f.properties.name) ? f.properties.name.replace(/ (Lake|Pond|Reservoir)$/, '') : null]), group: f.properties.km2 >= 2 ? 'Largest lakes' : 'Lakes & ponds', where: '', rank: f.properties.km2, geometry: f.geometry, extra: { km2: f.properties.km2 } })),
+    });
+  }
 }
 for (const st of FIFTY) {
   const ab = STATE_ABBR[st.id];
@@ -833,7 +1054,8 @@ for (const st of FIFTY) {
 const results = [];
 for (const cfg of packs) {
   if (only.length && !only.includes(cfg.id)) continue;
-  if (cfg.kind === 'roads') { await buildRoadPack(cfg); continue; }
+  if (cfg.kind === 'roads' || cfg.kind === 'rivers') { await buildRoadPack(cfg); continue; }
+  if (cfg.kind === 'points') { await buildSpotPack(cfg); continue; }
   const made = await cfg.make();
   await buildPack({ ...cfg, ...made });
 }
@@ -866,7 +1088,12 @@ for (const cfg of packs) {
       const c = by[`us-${ab}-counties`];
       const items = [item(`us-${ab}-counties`, c.nouns[0].toUpperCase() + c.nouns.slice(1))];
       if (by[`us-${ab}-towns`]) items.unshift(item(`us-${ab}-towns`, 'Towns & cities'));
+      if (by[`us-${ab}-cities`]) items.splice(items.length - 1, 0, item(`us-${ab}-cities`, 'Cities & villages'));
+      if (by[`us-${ab}-hamlets`]) items.splice(items.length - 1, 0, item(`us-${ab}-hamlets`, 'Hamlets & corners'));
       if (by[`us-${ab}-roads`]) items.push(item(`us-${ab}-roads`, 'Roads'));
+      if (by[`us-${ab}-rivers`]) items.push(item(`us-${ab}-rivers`, 'Rivers'));
+      if (by[`us-${ab}-lakes`]) items.push(item(`us-${ab}-lakes`, 'Lakes & ponds'));
+      if (by[`us-${ab}-peaks`]) items.push(item(`us-${ab}-peaks`, 'Mountains'));
       return { title: STATE_NAMES[fips], abbr: ab, items };
     }),
   });

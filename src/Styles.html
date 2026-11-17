@@ -242,4 +242,30 @@ svg.mv.roads .tw circle.start { fill: var(--ok); } svg.mv.roads .tw circle.end {
 svg.mv.roads .tw text { font-size: calc(var(--u, 10) * 10.5px); font-weight: 500; fill: var(--muted); dominant-baseline: auto; transform: translateY(calc(var(--u, 10) * -5px)); transform-box: fill-box; }
 svg.mv.roads .tw text.f { font-size: calc(var(--u, 10) * 13.5px); font-weight: 800; fill: var(--ink); }
 @keyframes pulseS { from { stroke: var(--tgt); } to { stroke: #ffd27a; } }
+/* rivers: the road look in water colours */
+svg.mv.rivers { --road: #1f78c8; --road2: #3f96d6; }
+@media (prefers-color-scheme: dark) { svg.mv.rivers { --road: #6db6f2; --road2: #5aa4dd; } }
+svg.mv.rivers .pl path { stroke-width: 3px; }
+svg.mv.rivers .pl path.g1 { stroke-width: 2px; }
+/* spots: cities, peaks and lakes on the town map */
+:root { --spot: #47525e; --peak: #8a5a2b; --lake: #7fb4e3; --bgriv: #a9cde8; }
+@media (prefers-color-scheme: dark) { :root { --spot: #c3ccd6; --peak: #d6a36a; --lake: #3f7fb8; --bgriv: #27506f; } }
+svg.mv.spots .base { fill: var(--land); stroke: var(--border); stroke-width: .35px; vector-effect: non-scaling-stroke; opacity: .9; pointer-events: none; }
+svg.mv.spots .stline { fill: none; stroke: var(--gline); stroke-width: 1.4px; vector-effect: non-scaling-stroke; pointer-events: none; opacity: .7; }
+svg.mv.spots .bgriv { fill: none; stroke: var(--bgriv); stroke-width: 1.2px; vector-effect: non-scaling-stroke; pointer-events: none; stroke-linecap: round; stroke-linejoin: round; }
+svg.mv.spots .pl path.pt { fill: none !important; stroke: none !important; pointer-events: none; }
+svg.mv.spots .pl path.s { fill: var(--lake); stroke: #3f7fb8; stroke-width: .8px; }
+svg.mv.spots .pl path.s.blank { fill: var(--blank); }
+svg.mv.spots.noborders .pl path.s:not(.ok):not(.okl):not(.badl):not(.bad):not(.tgt):not(.hov) { fill: var(--lake); }
+svg.mv.spots .mk circle { fill: var(--spot); stroke: var(--card); stroke-width: 1.3px; }
+svg.mv.spots.peak .mk circle { fill: var(--peak); }
+svg.mv.spots.lake .mk circle { fill: var(--lake); stroke: #3f7fb8; }
+svg.mv.spots .mk circle.blank { fill: var(--blank); stroke: var(--spot); }
+svg.mv.spots .mk circle.ok, svg.mv.spots .mk circle.okl { fill: var(--ok); } svg.mv.spots .mk circle.bad, svg.mv.spots .mk circle.badl { fill: var(--bad); }
+svg.mv.spots .mk circle.tgt, svg.mv.spots .mk circle.hint { fill: var(--tgt); stroke: var(--ink); stroke-width: 2px; }
+svg.mv.spots .mk circle.sel { stroke: var(--ink); stroke-width: 2.4px; }
+svg.mv.spots .mk circle.hov { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2px; }
+svg.mv.spots .mk circle.out { opacity: .35; }
+svg.mv.spots .lb text { font-size: calc(var(--u, 10) * 11.5px); }
+svg.mv.spots .lb text.f { font-size: calc(var(--u, 10) * 13px); }
 </style>
