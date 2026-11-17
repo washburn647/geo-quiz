@@ -21,6 +21,8 @@ const OUT = path.join(HERE, '..', 'maps');
 fs.mkdirSync(OUT, { recursive: true });
 const W = 10000;
 const only = process.argv.slice(2);
+// states whose maps get the shaded-terrain backdrop (needs elevation tiles: build/prep/fetch-dem.py)
+const TERRAIN_STATES = new Set(['50']);
 
 // ---------- sources ----------
 const readJSON = (f) => JSON.parse(fs.readFileSync(path.join(SRC, f), 'utf8'));
@@ -405,6 +407,7 @@ async function buildPack(cfg) {
     ctx: ctxOut, lines, outline, lakes,
   };
   if (cfg.insets) pack.frames = cfg.insets.map((s) => s.frame);
+  if (cfg.terrain && !cfg.insets) { clipTo(TIGHT); const tr = await renderTerrain(cfg.id, proj, H, outline); clipTo(WIDE); if (tr) pack.terrain = tr; }
   const json = JSON.stringify(pack);
   fs.writeFileSync(path.join(OUT, cfg.id + '.json'), json);
   console.log(`${cfg.id.padEnd(22)} ${String(P.length).padStart(4)} places ${String(groups.length).padStart(3)} groups ${(json.length / 1024).toFixed(0).padStart(5)} KB  ${P.filter((p) => !p.nb.length && !p.nr.length).length} isolated`);
@@ -570,7 +573,7 @@ for (const st of FIFTY) {
   const fips = st.id, ab = STATE_ABBR[fips];
   const [noun, nouns] = COUNTY_WORD[fips] || ['county', 'counties'];
   add({
-    id: `us-${ab}-counties`, title: STATE_NAMES[fips], state: fips, noun, nouns, interval: fips === '02' ? 2500 : undefined,
+    id: `us-${ab}-counties`, title: STATE_NAMES[fips], state: fips, noun, nouns, interval: fips === '02' ? 2500 : undefined, terrain: TERRAIN_STATES.has(fips),
     make() {
       const cs = US_COUNTIES.filter((f) => f.id.slice(0, 2) === fips && f.geometry);
       const cnt = {};
@@ -604,7 +607,7 @@ function townName(p, all) {
 const TOWN_ALT = { Enosburgh: ['Enosburg'], 'Buels Gore': ["Buel's Gore"], Alburgh: ['Alburg'] };
 for (const [fips, ab] of Object.entries(TOWN_STATES)) {
   add({
-    id: `us-${ab}-towns`, title: STATE_NAMES[fips], state: fips, noun: 'town', nouns: 'towns & cities', groupNoun: fips === '09' ? 'Planning region' : 'County',
+    id: `us-${ab}-towns`, title: STATE_NAMES[fips], state: fips, noun: 'town', nouns: 'towns & cities', terrain: TERRAIN_STATES.has(fips), groupNoun: fips === '09' ? 'Planning region' : 'County',
     async make() {
       const fs1 = (await readCousub(fips)).filter((f) => f.geometry && !/not defined/i.test(f.properties.NAME));
       const props = fs1.map((f) => f.properties);
@@ -934,7 +937,7 @@ async function buildRoadPack(cfg) {
     towns: towns.sort((a, b) => b.a - a.a).map((t) => ({ n: t.n, lx: t.lx, ly: t.ly, r: t.r })),
     base: encode(basePolys, true), outline: encode(stOutline, true), ctx: ctxOut, lakes, lines: '',
   };
-  { const tr = terrainRef(ab, H); if (tr) pack.terrain = tr; }
+  if (TERRAIN_STATES.has(fips)) { const tr = await renderTerrain(`us-${ab}`, proj, H, encode(stOutline, true)); if (tr) pack.terrain = tr; }
   const json = JSON.stringify(pack);
   fs.writeFileSync(path.join(OUT, cfg.id + '.json'), json);
   console.log(`${cfg.id.padEnd(22)} ${String(R.length).padStart(4)} ${cfg.nouns} ${String(R.filter((r) => r.g === 0).length).padStart(3)} major ${String(towns.length).padStart(4)} towns ${(json.length / 1024).toFixed(0).padStart(5)} KB  ${towns.filter((t) => !t.r.length).length} towns off-road`);
@@ -1055,7 +1058,7 @@ async function buildSpotPack(cfg) {
     }),
     base: encode(basePolys, true), outline: encode(stOutline, true), ctx: ctxOut, lakes, rivers, lines: '',
   };
-  { const tr = terrainRef(ab, H); if (tr) pack.terrain = tr; }
+  if (TERRAIN_STATES.has(fips)) { const tr = await renderTerrain(`us-${ab}`, proj, H, encode(stOutline, true)); if (tr) pack.terrain = tr; }
   const json = JSON.stringify(pack);
   fs.writeFileSync(path.join(OUT, cfg.id + '.json'), json);
   console.log(`${cfg.id.padEnd(22)} ${String(P.length).padStart(4)} ${cfg.nouns.padEnd(18)} ${String(groups.length).padStart(3)} groups ${(json.length / 1024).toFixed(0).padStart(5)} KB`);
@@ -1132,77 +1135,97 @@ for (const st of FIFTY) {
   add({ id: `us-${ab}-roads`, title: STATE_NAMES[st.id], state: st.id, kind: 'roads', fips: st.id, ab, noun: 'road', nouns: 'roads' });
 }
 
-// ---------- terrain backdrop: one shaded-relief image per state, in the state frame ----------
-// node build-maps.mjs terrain:vt   (needs elevation tiles from build/prep/fetch-dem.py)
-// Writes maps/terrain/us-<ab>.webp; the state's road, river and spot packs then point at it.
+// ---------- terrain backdrop: shaded relief behind a pack, in that pack's own frame ----------
+// Needs elevation tiles from build/prep/fetch-dem.py. Each pack that asks for it (TERRAIN_STATES, and
+// cfg.terrain on area packs) gets maps/terrain/<name>.webp and <name>-dark.webp; land outside the
+// pack's outline is washed out so the place being quizzed stands out from its neighbours.
 const TERRAIN_M = 0.15; // margin around the map, as a fraction of W
-const terrainFile = (ab) => path.join(OUT, 'terrain', `us-${ab}.webp`);
-const terrainRef = (ab, H) => (fs.existsSync(terrainFile(ab)) ? { src: `terrain/us-${ab}.webp`, x: -W * TERRAIN_M, y: -W * TERRAIN_M, w: W * (1 + 2 * TERRAIN_M), h: H + W * 2 * TERRAIN_M } : null);
-async function buildTerrain(ab) {
+const terrainCache = new Map(); // one render per frame, shared by packs with the same frame
+const _dem = new Map();
+async function demTile(tx, ty) {
   const sharp = require('sharp');
-  const fips = Object.entries(STATE_ABBR).find(([, a]) => a === ab)[0];
-  const F = stateFrame(fips);
-  const Z = 12, N = 2 ** Z, DEM = path.join(SRC, 'dem', String(Z));
-  const tiles = new Map();
-  const tile = async (tx, ty) => {
-    const k = tx + '/' + ty;
-    if (!tiles.has(k)) {
-      const f = path.join(DEM, String(tx), ty + '.png');
-      if (!fs.existsSync(f)) tiles.set(k, null);
-      else {
-        const { data } = await sharp(f).removeAlpha().raw().toBuffer({ resolveWithObject: true });
-        const e = new Float32Array(65536);
-        for (let i = 0; i < 65536; i++) e[i] = data[i * 3] * 256 + data[i * 3 + 1] + data[i * 3 + 2] / 256 - 32768;
-        tiles.set(k, e);
-      }
+  const k = tx + '/' + ty;
+  if (!_dem.has(k)) {
+    const f = path.join(SRC, 'dem', '12', String(tx), ty + '.png');
+    if (!fs.existsSync(f)) _dem.set(k, null);
+    else {
+      const { data } = await sharp(f).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+      const e = new Float32Array(65536);
+      for (let i = 0; i < 65536; i++) e[i] = data[i * 3] * 256 + data[i * 3 + 1] + data[i * 3 + 2] / 256 - 32768;
+      _dem.set(k, e);
     }
-    return tiles.get(k);
-  };
-  const PXW = 2200, x0 = -W * TERRAIN_M, y0 = -W * TERRAIN_M, wU = W * (1 + 2 * TERRAIN_M), hU = F.H + W * 2 * TERRAIN_M;
+    if (_dem.size > 3000) _dem.delete(_dem.keys().next().value);
+  }
+  return _dem.get(k);
+}
+// name: file stem; proj: the pack's projection (W-wide frame, height H); outline: the pack's encoded outline path
+async function renderTerrain(name, proj, H, outline) {
+  if (terrainCache.has(name)) return terrainCache.get(name);
+  const sharp = require('sharp');
+  const N = 2 ** 12;
+  const PXW = 2200, x0 = -W * TERRAIN_M, y0 = -W * TERRAIN_M, wU = W * (1 + 2 * TERRAIN_M), hU = H + W * 2 * TERRAIN_M;
   const s = wU / PXW, PXH = Math.round(hU / s);
+  // metres per pixel at the middle of the map
+  const a = proj.invert([W / 2, H / 2]), b = proj.invert([W / 2 + s, H / 2]);
+  const cell = d3.geoDistance(a, b) * 6371000;
   const elev = new Float32Array(PXW * PXH).fill(NaN);
-  // which tiles are needed, then sample (bilinear inside a tile, nearest across tile edges)
+  let any = false;
   for (let j = 0; j < PXH; j++) for (let i = 0; i < PXW; i++) {
-    const ll = F.proj.invert([x0 + (i + 0.5) * s, y0 + (j + 0.5) * s]);
-    if (!ll) continue;
+    const ll = proj.invert([x0 + (i + 0.5) * s, y0 + (j + 0.5) * s]);
+    if (!ll || !isFinite(ll[0])) continue;
     const fx = (ll[0] + 180) / 360 * N * 256, fy = (1 - Math.asinh(Math.tan(ll[1] * Math.PI / 180)) / Math.PI) / 2 * N * 256;
     const px = Math.floor(fx), py = Math.floor(fy);
-    const t = await tile(px >> 8, py >> 8);
+    const t = await demTile(px >> 8, py >> 8);
     if (!t) continue;
+    any = true;
     const cx = px & 255, cy = py & 255;
     if (cx < 255 && cy < 255) {
       const ax = fx - px, ay = fy - py, o = cy * 256 + cx;
       elev[j * PXW + i] = (t[o] * (1 - ax) + t[o + 1] * ax) * (1 - ay) + (t[o + 256] * (1 - ax) + t[o + 257] * ax) * ay;
     } else elev[j * PXW + i] = t[cy * 256 + cx];
   }
+  if (!any) { console.warn('  ! no elevation tiles for terrain', name); terrainCache.set(name, null); return null; }
+  // the pack's outline as a mask (sharp rasterises the SVG path)
+  const svgMask = `<svg xmlns="http://www.w3.org/2000/svg" width="${PXW}" height="${PXH}" viewBox="${x0} ${y0} ${wU} ${hU}"><path d="${outline}" fill="#fff" fill-rule="evenodd"/></svg>`;
+  const { data: mraw } = await sharp(Buffer.from(svgMask)).greyscale().blur(1.2).raw().toBuffer({ resolveWithObject: true });
   // light from the north-west; slopes exaggerated so low hills still read
-  const cell = s * F.mPerUnit, zf = 2.6, az = 315 * Math.PI / 180, alt = 45 * Math.PI / 180;
+  const zf = 2.6, az = 315 * Math.PI / 180, alt = 45 * Math.PI / 180;
   const lx = Math.sin(az) * Math.cos(alt), ly = Math.cos(az) * Math.cos(alt), lz = Math.sin(alt);
-  const tint = [[0, [226, 238, 216]], [250, [238, 240, 214]], [500, [244, 232, 200]], [800, [232, 212, 180]], [1100, [216, 196, 170]], [1400, [236, 228, 220]]];
-  const colorAt = (m) => {
-    let a = tint[0], b = tint[tint.length - 1];
-    for (let k = 1; k < tint.length; k++) if (m <= tint[k][0]) { a = tint[k - 1]; b = tint[k]; break; }
-    const f = Math.min(1, Math.max(0, (m - a[0]) / (b[0] - a[0] || 1)));
-    return a[1].map((v, c) => v + (b[1][c] - v) * f);
+  const PAL = {
+    light: { tint: [[0, [226, 238, 216]], [250, [238, 240, 214]], [500, [244, 232, 200]], [800, [232, 212, 180]], [1100, [216, 196, 170]], [1400, [236, 228, 220]]], out: [232, 226, 212], outMix: 0.62, k0: 0.47, k1: 0.75 },
+    dark: { tint: [[0, [52, 66, 64]], [250, [60, 70, 62]], [500, [72, 70, 58]], [800, [82, 74, 62]], [1100, [92, 84, 76]], [1400, [110, 108, 106]]], out: [30, 37, 46], outMix: 0.7, k0: 0.35, k1: 0.95 },
   };
-  const out = Buffer.alloc(PXW * PXH * 4);
-  for (let j = 0; j < PXH; j++) for (let i = 0; i < PXW; i++) {
-    const o = j * PXW + i, z = elev[o];
-    if (Number.isNaN(z)) continue;
-    const zl = elev[o - (i > 0 ? 1 : 0)], zr = elev[o + (i < PXW - 1 ? 1 : 0)], zu = elev[o - (j > 0 ? PXW : 0)], zd = elev[o + (j < PXH - 1 ? PXW : 0)];
-    if (Number.isNaN(zl + zr + zu + zd)) continue;
-    const dx = (zr - zl) / (2 * cell) * zf, dy = (zu - zd) / (2 * cell) * zf; // east, north
-    const nl = Math.hypot(dx, dy, 1);
-    const shade = (-dx * lx - dy * ly + lz) / nl; // 0..1, flat = sin(alt) = .707
-    const k = 0.47 + 0.75 * shade; // flat ≈ 1.0
-    const c = colorAt(z);
-    out[o * 4] = Math.max(0, Math.min(255, c[0] * k)); out[o * 4 + 1] = Math.max(0, Math.min(255, c[1] * k)); out[o * 4 + 2] = Math.max(0, Math.min(255, c[2] * k)); out[o * 4 + 3] = 255;
-  }
+  const ref = { x: x0, y: y0, w: wU, h: hU };
   fs.mkdirSync(path.join(OUT, 'terrain'), { recursive: true });
-  await sharp(out, { raw: { width: PXW, height: PXH, channels: 4 } }).webp({ quality: 72, alphaQuality: 80 }).toFile(terrainFile(ab));
-  console.log(`terrain us-${ab}  ${PXW}x${PXH}px  ${(fs.statSync(terrainFile(ab)).size / 1024).toFixed(0)} KB  (${Math.round(cell)} m per pixel)`);
+  for (const [mode, P] of Object.entries(PAL)) {
+    const colorAt = (m) => {
+      let lo = P.tint[0], hi = P.tint[P.tint.length - 1];
+      for (let k = 1; k < P.tint.length; k++) if (m <= P.tint[k][0]) { lo = P.tint[k - 1]; hi = P.tint[k]; break; }
+      const f = Math.min(1, Math.max(0, (m - lo[0]) / (hi[0] - lo[0] || 1)));
+      return lo[1].map((v, c) => v + (hi[1][c] - v) * f);
+    };
+    const out = Buffer.alloc(PXW * PXH * 4);
+    for (let j = 0; j < PXH; j++) for (let i = 0; i < PXW; i++) {
+      const o = j * PXW + i, z = elev[o];
+      if (Number.isNaN(z)) continue;
+      const zl = elev[o - (i > 0 ? 1 : 0)], zr = elev[o + (i < PXW - 1 ? 1 : 0)], zu = elev[o - (j > 0 ? PXW : 0)], zd = elev[o + (j < PXH - 1 ? PXW : 0)];
+      if (Number.isNaN(zl + zr + zu + zd)) continue;
+      const dx = (zr - zl) / (2 * cell) * zf, dy = (zu - zd) / (2 * cell) * zf; // east, north
+      const shade = (-dx * lx - dy * ly + lz) / Math.hypot(dx, dy, 1);
+      const k = P.k0 + P.k1 * shade;
+      const c = colorAt(z);
+      const inside = mraw[o] / 255, wash = (1 - inside) * P.outMix;
+      for (let ch = 0; ch < 3; ch++) out[o * 4 + ch] = Math.max(0, Math.min(255, (c[ch] * k) * (1 - wash) + P.out[ch] * wash));
+      out[o * 4 + 3] = 255;
+    }
+    const file = path.join(OUT, 'terrain', name + (mode === 'dark' ? '-dark' : '') + '.webp');
+    await sharp(out, { raw: { width: PXW, height: PXH, channels: 4 } }).webp({ quality: 72, alphaQuality: 80 }).toFile(file);
+    ref[mode === 'dark' ? 'dark' : 'src'] = `terrain/${path.basename(file)}`;
+    console.log(`  terrain ${path.basename(file)}  ${PXW}x${PXH}px  ${(fs.statSync(file).size / 1024).toFixed(0)} KB  (${Math.round(cell)} m per pixel)`);
+  }
+  terrainCache.set(name, ref);
+  return ref;
 }
-for (const t of only.filter((a) => a.startsWith('terrain:'))) await buildTerrain(t.slice(8));
 
 // ---------- run ----------
 const results = [];

@@ -24,12 +24,13 @@ function MapView(host, pack, opt) {
   html += '<g class="ctx">' + pack.ctx.map((c) => '<path d="' + c.d + '"/>').join('') + '</g>';
   // shaded terrain under the town lines (state maps, when the maps come from the static host)
   const TER = pack.terrain && S.base && !opt.static ? pack.terrain : null;
-  const terKey = 'ter:' + (pack.sub || pack.kind);
+  const terKey = 'ter:' + (pack.sub || pack.kind || 'area');
+  const terSrc = () => S.base + (TER.dark && matchMedia('(prefers-color-scheme: dark)').matches ? TER.dark : TER.src);
   let terOn = false;
   if (TER) {
     const pref = store.get(terKey);
-    terOn = pref == null ? (pack.sub === 'peak' || pack.kind === 'rivers') : !!pref;
-    html += '<image class="terrain" x="' + TER.x + '" y="' + TER.y + '" width="' + TER.w + '" height="' + TER.h + '" preserveAspectRatio="none"' + (terOn ? ' href="' + S.base + TER.src + '"' : ' style="display:none"') + '/>';
+    terOn = pref == null ? true : !!pref;
+    html += '<image class="terrain" x="' + TER.x + '" y="' + TER.y + '" width="' + TER.w + '" height="' + TER.h + '" preserveAspectRatio="none"' + (terOn ? ' href="' + terSrc() + '"' : ' style="display:none"') + '/>';
     if (terOn) svg.classList.add('ter');
   }
   if (ROADS) {
@@ -317,7 +318,7 @@ function MapView(host, pack, opt) {
         terOn = !terOn;
         store.set(terKey, terOn ? 1 : 0);
         const im = $('image.terrain', svg);
-        if (terOn && !im.getAttribute('href')) im.setAttribute('href', S.base + TER.src);
+        if (terOn) im.setAttribute('href', terSrc());
         im.style.display = terOn ? '' : 'none';
         svg.classList.toggle('ter', terOn);
         b.classList.toggle('on', terOn);

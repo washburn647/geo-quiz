@@ -1931,7 +1931,7 @@
    "count": 14,
    "noun": "county",
    "nouns": "counties",
-   "kb": 10
+   "kb": 11
   },
   "us-nv-counties": {
    "title": "Nevada",
@@ -2015,7 +2015,7 @@
    "count": 256,
    "noun": "town",
    "nouns": "towns & cities",
-   "kb": 73
+   "kb": 74
   },
   "us-ct-towns": {
    "title": "Connecticut",
@@ -2057,7 +2057,7 @@
    "count": 86,
    "noun": "lake",
    "nouns": "lakes & ponds",
-   "kb": 102
+   "kb": 103
   },
   "us-az-roads": {
    "title": "Arizona",

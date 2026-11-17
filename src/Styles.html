@@ -14,7 +14,7 @@
   :root {
     --bg: #11161d; --card: #19212b; --ink: #e6ebf0; --muted: #94a0ad; --line: #2a3542;
     --accent: #5b93f0; --accent-soft: #233650; --ok: #43b974; --ok-soft: #1b3a29; --bad: #ec6060; --bad-soft: #452222;
-    --water: #142838; --ctx: #232c37; --land: #2c3744; --blank: #3a4655; --border: #5d6b7a; --gline: #c8d2dc;
+    --water: #0f2233; --ctx: #222a33; --land: #3a4655; --blank: #4f5d6d; --border: #7d8b99; --gline: #dfe7ee;
     --lbl: #eef2f6; --halo: rgba(17,22,29,.85); --ctxlbl: #7d8792;
     --m0: #47525e;
     --shadow: 0 1px 2px rgba(0,0,0,.3), 0 4px 14px rgba(0,0,0,.25);
@@ -268,9 +268,18 @@ svg.mv.spots .mk circle.hov { fill: var(--accent-soft); stroke: var(--accent); s
 svg.mv.spots .mk circle.out { opacity: .35; }
 svg.mv.spots .lb text { font-size: calc(var(--u, 10) * 11.5px); }
 svg.mv.spots .lb text.f { font-size: calc(var(--u, 10) * 13px); }
-/* terrain backdrop */
-svg.mv image.terrain { pointer-events: none; opacity: .92; }
+/* terrain backdrop: the relief shows through; on area maps the places go see-through and keep their colours */
+svg.mv image.terrain { pointer-events: none; }
 svg.mv.ter .base { fill: none; }
+svg.mv.ter:not(.roads):not(.spots) .pl path { fill-opacity: .72; }
+svg.mv.ter:not(.roads):not(.spots) .pl path:not(.ok):not(.okl):not(.badl):not(.bad):not(.tgt):not(.hov):not(.route):not(.start):not(.end):not(.flashbad):not(.flashok):not(.blank):not(.hint):not(.out):not([style*="fill"]) { fill: transparent; }
+svg.mv.ter:not(.roads):not(.spots) .pl path.blank { fill-opacity: .45; }
+svg.mv.ter:not(.roads):not(.spots) .pl path { stroke: var(--terline); }
+svg.mv.ter .lakes { fill: var(--terwater); }
+:root { --terline: rgba(60, 70, 80, .55); --terwater: #b9d6ec; }
+@media (prefers-color-scheme: dark) { :root { --terline: rgba(200, 212, 224, .45); --terwater: #1b3a52; } }
 .zoombtns button.on { background: var(--accent-soft); }
-@media (prefers-color-scheme: dark) { svg.mv image.terrain { opacity: .38; } }
+/* a road or river is a line: never fill the shape it encloses */
+svg.mv.roads .pl path { fill: none !important; }
+svg.mv.roads .pl path.flashbad { animation: pulseS 0.25s ease-in-out 2 alternate; }
 </style>
