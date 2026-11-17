@@ -1,7 +1,7 @@
 // Geography Quiz: web app entry points, map loading and the sheet menu.
 // (Menu handlers can't end in _ : Apps Script hides those from menus.)
 
-var BUILD = '2.0-t1';
+var BUILD = '2.0-t2';
 // Where the map files are served from (the maps/ folder of the GitHub Pages site), ending in '/'.
 // Empty: maps come from this script's own map_*.html files, and there is no terrain backdrop.
 var MAP_BASE = 'https://washburn647.github.io/geo-quiz/maps/';
