@@ -668,6 +668,85 @@ function pointAlong(pts, frac) {
   return pts[pts.length - 1];
 }
 
+// Census files a road under one name per stretch, so a route through a village (filed as "Main St")
+// or sharing pavement with another route shows as a gap. This joins a route's separate pieces by the
+// shortest way along any primary or secondary road, when that way is nearly straight (it is the
+// same road), up to 12 km. States are switched on one at a time as their maps are checked.
+const BRIDGE_STATES = new Set(['50']);
+async function bridgeRoutes(fips, routes) {
+  const zip = path.join(SRC, 'roads', `tl_2023_${fips}_prisecroads.zip`).replace(/\\/g, '/');
+  const out = await mapshaper.applyCommands(`-i "${zip}" -o out.json format=geojson`);
+  const key = (c) => c[0].toFixed(5) + ',' + c[1].toFixed(5);
+  const kmBetween = (a, b) => Math.hypot((a[0] - b[0]) * 111.32 * Math.cos((a[1] + b[1]) / 2 * Math.PI / 180), (a[1] - b[1]) * 110.57);
+  const pos = new Map(), adj = new Map();
+  const link = (a, b) => {
+    const ka = key(a), kb = key(b);
+    if (ka === kb) return;
+    if (!pos.has(ka)) { pos.set(ka, a); adj.set(ka, []); }
+    if (!pos.has(kb)) { pos.set(kb, b); adj.set(kb, []); }
+    const d = kmBetween(a, b);
+    adj.get(ka).push([kb, d]); adj.get(kb).push([ka, d]);
+  };
+  for (const f of JSON.parse(out['out.json']).features) {
+    if (!f.geometry) continue;
+    const ls = f.geometry.type === 'LineString' ? [f.geometry.coordinates] : f.geometry.coordinates;
+    for (const l of ls) for (let i = 1; i < l.length; i++) link(l[i - 1], l[i]);
+  }
+  let joined = 0, before = 0, after = 0;
+  for (const r of routes.values()) {
+    // the route's own pieces as connected sets of points
+    const comp = new Map();
+    const find = (k) => { let x = k; while (comp.get(x) !== x) x = comp.get(x); let y = k; while (comp.get(y) !== x) { const n = comp.get(y); comp.set(y, x); y = n; } return x; };
+    for (const l of r.lines) for (let i = 0; i < l.length; i++) {
+      const k = key(l[i]);
+      if (!comp.has(k)) comp.set(k, k);
+      if (i) { const a = find(key(l[i - 1])), b = find(k); if (a !== b) comp.set(a, b); }
+    }
+    const roots = () => new Set(Array.from(comp.keys()).map(find));
+    before += roots().size;
+    for (let guard = 0; guard < 200; guard++) {
+      const rs = Array.from(roots());
+      if (rs.length < 2) break;
+      // smallest piece first: grow outward along the road network until another piece is met
+      const size = new Map();
+      for (const k of comp.keys()) { const f0 = find(k); size.set(f0, (size.get(f0) || 0) + 1); }
+      rs.sort((a, b) => size.get(a) - size.get(b));
+      let done = false;
+      for (const root of rs.slice(0, -1)) {
+        const dist = new Map(), prev = new Map(), src = new Map();
+        const heap = [];
+        const push = (k, d) => { heap.push([d, k]); let i = heap.length - 1; while (i > 0) { const p2 = (i - 1) >> 1; if (heap[p2][0] <= heap[i][0]) break; [heap[p2], heap[i]] = [heap[i], heap[p2]]; i = p2; } };
+        const pop = () => { const top = heap[0], last = heap.pop(); if (heap.length) { heap[0] = last; let i = 0; for (;;) { let m = i; const l = 2 * i + 1, rr = l + 1; if (l < heap.length && heap[l][0] < heap[m][0]) m = l; if (rr < heap.length && heap[rr][0] < heap[m][0]) m = rr; if (m === i) break; [heap[m], heap[i]] = [heap[i], heap[m]]; i = m; } } return top; };
+        for (const k of comp.keys()) if (find(k) === root && adj.has(k)) { dist.set(k, 0); src.set(k, k); push(k, 0); }
+        let hit = null;
+        while (heap.length) {
+          const [d, k] = pop();
+          if (d > dist.get(k)) continue;
+          if (d > 12) break;
+          if (comp.has(k) && find(k) !== root) { hit = k; break; }
+          for (const [n, w] of adj.get(k)) {
+            const nd = d + w;
+            if (nd < (dist.has(n) ? dist.get(n) : Infinity)) { dist.set(n, nd); prev.set(n, k); src.set(n, src.get(k)); push(n, nd); }
+          }
+        }
+        if (!hit) continue;
+        const straight = kmBetween(pos.get(src.get(hit)), pos.get(hit));
+        if (dist.get(hit) > straight * 1.6 + 0.3) continue;
+        const line = [];
+        for (let k = hit; k !== undefined; k = prev.get(k)) line.push(pos.get(k));
+        r.lines.push(line);
+        for (const c of line) { const k = key(c); if (!comp.has(k)) comp.set(k, k); }
+        for (let i = 1; i < line.length; i++) { const a = find(key(line[i - 1])), b = find(key(line[i])); if (a !== b) comp.set(a, b); }
+        joined++; done = true;
+        break;
+      }
+      if (!done) break;
+    }
+    after += roots().size;
+  }
+  console.log(`  bridged ${joined} gaps: ${before} pieces -> ${after} in ${routes.size} routes`);
+}
+
 async function buildRoadPack(cfg) {
   const { fips, ab } = cfg;
   if (!STATE_NAMES_BY_AB) STATE_NAMES_BY_AB = Object.fromEntries(Object.entries(STATE_ABBR).map(([f, a]) => [a, STATE_NAMES[f]]));
@@ -684,6 +763,7 @@ async function buildRoadPack(cfg) {
     if (g.type === 'LineString') routes.get(r.key).lines.push(g.coordinates);
     else if (g.type === 'MultiLineString') routes.get(r.key).lines.push(...g.coordinates);
   }
+  if (!RIV && BRIDGE_STATES.has(fips)) await bridgeRoutes(fips, routes);
   // 2. simplify, project (fit to the state)
   const extentKm = naiveExtentKm([stateF]);
   const interval = extentKm * 1000 / W * 6;
@@ -709,7 +789,7 @@ async function buildRoadPack(cfg) {
     if (!f || !f.geometry) continue;
     const pieces = cleanLines(rings(gp, f)).filter((l) => lineLen(l) > 3);
     const len = pieces.reduce((s, l) => s + lineLen(l), 0);
-    if (!pieces.length || len < W * 0.015) continue; // drop stubs
+    if (!pieces.length || len < W * (r.type === 'I' && BRIDGE_STATES.has(fips) ? 0.004 : 0.015)) continue; // drop stubs (short interstate spurs like I-189 stay)
     const longest = pieces.reduce((a, b) => (lineLen(b) > lineLen(a) ? b : a));
     const [lx, ly] = pointAlong(longest, 0.5);
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
@@ -723,7 +803,7 @@ async function buildRoadPack(cfg) {
     R.forEach((r) => { r.g = r.km >= 40 ? 0 : r.km >= 20 ? 1 : 2; });
     R.sort((a, b) => a.g - b.g || b.km - a.km);
   } else {
-  R = R.slice(0, 90);
+  R = R.slice(0, BRIDGE_STATES.has(fips) ? 400 : 90); // checked states keep every numbered route
   const nMajor = Math.max(10, Math.round(R.length * 0.35));
   let stateRank = 0;
   const nIU = R.filter((r) => r.type !== 'S').length;
@@ -854,6 +934,7 @@ async function buildRoadPack(cfg) {
     towns: towns.sort((a, b) => b.a - a.a).map((t) => ({ n: t.n, lx: t.lx, ly: t.ly, r: t.r })),
     base: encode(basePolys, true), outline: encode(stOutline, true), ctx: ctxOut, lakes, lines: '',
   };
+  { const tr = terrainRef(ab, H); if (tr) pack.terrain = tr; }
   const json = JSON.stringify(pack);
   fs.writeFileSync(path.join(OUT, cfg.id + '.json'), json);
   console.log(`${cfg.id.padEnd(22)} ${String(R.length).padStart(4)} ${cfg.nouns} ${String(R.filter((r) => r.g === 0).length).padStart(3)} major ${String(towns.length).padStart(4)} towns ${(json.length / 1024).toFixed(0).padStart(5)} KB  ${towns.filter((t) => !t.r.length).length} towns off-road`);
@@ -974,6 +1055,7 @@ async function buildSpotPack(cfg) {
     }),
     base: encode(basePolys, true), outline: encode(stOutline, true), ctx: ctxOut, lakes, rivers, lines: '',
   };
+  { const tr = terrainRef(ab, H); if (tr) pack.terrain = tr; }
   const json = JSON.stringify(pack);
   fs.writeFileSync(path.join(OUT, cfg.id + '.json'), json);
   console.log(`${cfg.id.padEnd(22)} ${String(P.length).padStart(4)} ${cfg.nouns.padEnd(18)} ${String(groups.length).padStart(3)} groups ${(json.length / 1024).toFixed(0).padStart(5)} KB`);
@@ -1049,6 +1131,78 @@ for (const st of FIFTY) {
   const ab = STATE_ABBR[st.id];
   add({ id: `us-${ab}-roads`, title: STATE_NAMES[st.id], state: st.id, kind: 'roads', fips: st.id, ab, noun: 'road', nouns: 'roads' });
 }
+
+// ---------- terrain backdrop: one shaded-relief image per state, in the state frame ----------
+// node build-maps.mjs terrain:vt   (needs elevation tiles from build/prep/fetch-dem.py)
+// Writes maps/terrain/us-<ab>.webp; the state's road, river and spot packs then point at it.
+const TERRAIN_M = 0.15; // margin around the map, as a fraction of W
+const terrainFile = (ab) => path.join(OUT, 'terrain', `us-${ab}.webp`);
+const terrainRef = (ab, H) => (fs.existsSync(terrainFile(ab)) ? { src: `terrain/us-${ab}.webp`, x: -W * TERRAIN_M, y: -W * TERRAIN_M, w: W * (1 + 2 * TERRAIN_M), h: H + W * 2 * TERRAIN_M } : null);
+async function buildTerrain(ab) {
+  const sharp = require('sharp');
+  const fips = Object.entries(STATE_ABBR).find(([, a]) => a === ab)[0];
+  const F = stateFrame(fips);
+  const Z = 12, N = 2 ** Z, DEM = path.join(SRC, 'dem', String(Z));
+  const tiles = new Map();
+  const tile = async (tx, ty) => {
+    const k = tx + '/' + ty;
+    if (!tiles.has(k)) {
+      const f = path.join(DEM, String(tx), ty + '.png');
+      if (!fs.existsSync(f)) tiles.set(k, null);
+      else {
+        const { data } = await sharp(f).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+        const e = new Float32Array(65536);
+        for (let i = 0; i < 65536; i++) e[i] = data[i * 3] * 256 + data[i * 3 + 1] + data[i * 3 + 2] / 256 - 32768;
+        tiles.set(k, e);
+      }
+    }
+    return tiles.get(k);
+  };
+  const PXW = 2200, x0 = -W * TERRAIN_M, y0 = -W * TERRAIN_M, wU = W * (1 + 2 * TERRAIN_M), hU = F.H + W * 2 * TERRAIN_M;
+  const s = wU / PXW, PXH = Math.round(hU / s);
+  const elev = new Float32Array(PXW * PXH).fill(NaN);
+  // which tiles are needed, then sample (bilinear inside a tile, nearest across tile edges)
+  for (let j = 0; j < PXH; j++) for (let i = 0; i < PXW; i++) {
+    const ll = F.proj.invert([x0 + (i + 0.5) * s, y0 + (j + 0.5) * s]);
+    if (!ll) continue;
+    const fx = (ll[0] + 180) / 360 * N * 256, fy = (1 - Math.asinh(Math.tan(ll[1] * Math.PI / 180)) / Math.PI) / 2 * N * 256;
+    const px = Math.floor(fx), py = Math.floor(fy);
+    const t = await tile(px >> 8, py >> 8);
+    if (!t) continue;
+    const cx = px & 255, cy = py & 255;
+    if (cx < 255 && cy < 255) {
+      const ax = fx - px, ay = fy - py, o = cy * 256 + cx;
+      elev[j * PXW + i] = (t[o] * (1 - ax) + t[o + 1] * ax) * (1 - ay) + (t[o + 256] * (1 - ax) + t[o + 257] * ax) * ay;
+    } else elev[j * PXW + i] = t[cy * 256 + cx];
+  }
+  // light from the north-west; slopes exaggerated so low hills still read
+  const cell = s * F.mPerUnit, zf = 2.6, az = 315 * Math.PI / 180, alt = 45 * Math.PI / 180;
+  const lx = Math.sin(az) * Math.cos(alt), ly = Math.cos(az) * Math.cos(alt), lz = Math.sin(alt);
+  const tint = [[0, [226, 238, 216]], [250, [238, 240, 214]], [500, [244, 232, 200]], [800, [232, 212, 180]], [1100, [216, 196, 170]], [1400, [236, 228, 220]]];
+  const colorAt = (m) => {
+    let a = tint[0], b = tint[tint.length - 1];
+    for (let k = 1; k < tint.length; k++) if (m <= tint[k][0]) { a = tint[k - 1]; b = tint[k]; break; }
+    const f = Math.min(1, Math.max(0, (m - a[0]) / (b[0] - a[0] || 1)));
+    return a[1].map((v, c) => v + (b[1][c] - v) * f);
+  };
+  const out = Buffer.alloc(PXW * PXH * 4);
+  for (let j = 0; j < PXH; j++) for (let i = 0; i < PXW; i++) {
+    const o = j * PXW + i, z = elev[o];
+    if (Number.isNaN(z)) continue;
+    const zl = elev[o - (i > 0 ? 1 : 0)], zr = elev[o + (i < PXW - 1 ? 1 : 0)], zu = elev[o - (j > 0 ? PXW : 0)], zd = elev[o + (j < PXH - 1 ? PXW : 0)];
+    if (Number.isNaN(zl + zr + zu + zd)) continue;
+    const dx = (zr - zl) / (2 * cell) * zf, dy = (zu - zd) / (2 * cell) * zf; // east, north
+    const nl = Math.hypot(dx, dy, 1);
+    const shade = (-dx * lx - dy * ly + lz) / nl; // 0..1, flat = sin(alt) = .707
+    const k = 0.47 + 0.75 * shade; // flat ≈ 1.0
+    const c = colorAt(z);
+    out[o * 4] = Math.max(0, Math.min(255, c[0] * k)); out[o * 4 + 1] = Math.max(0, Math.min(255, c[1] * k)); out[o * 4 + 2] = Math.max(0, Math.min(255, c[2] * k)); out[o * 4 + 3] = 255;
+  }
+  fs.mkdirSync(path.join(OUT, 'terrain'), { recursive: true });
+  await sharp(out, { raw: { width: PXW, height: PXH, channels: 4 } }).webp({ quality: 72, alphaQuality: 80 }).toFile(terrainFile(ab));
+  console.log(`terrain us-${ab}  ${PXW}x${PXH}px  ${(fs.statSync(terrainFile(ab)).size / 1024).toFixed(0)} KB  (${Math.round(cell)} m per pixel)`);
+}
+for (const t of only.filter((a) => a.startsWith('terrain:'))) await buildTerrain(t.slice(8));
 
 // ---------- run ----------
 const results = [];

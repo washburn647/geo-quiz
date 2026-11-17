@@ -2,10 +2,13 @@
 // (Menu handlers can't end in _ : Apps Script hides those from menus.)
 
 var BUILD = '1.2';
+// Where the map files are served from (the maps/ folder of the GitHub Pages site), ending in '/'.
+// Empty: maps come from this script's own map_*.html files, and there is no terrain backdrop.
+var MAP_BASE = '';
 
 function doGet() {
   var t = HtmlService.createTemplateFromFile('Index');
-  t.boot = JSON.stringify({ build: BUILD, catalog: JSON.parse(include('map_catalog')), progress: summary_(), settings: getSettings_() })
+  t.boot = JSON.stringify({ build: BUILD, base: MAP_BASE, catalog: JSON.parse(include('map_catalog')), progress: summary_(), settings: getSettings_() })
     .replace(/</g, '\\u003c');
   return t.evaluate()
     .setTitle('Geography Quiz')

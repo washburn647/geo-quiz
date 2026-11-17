@@ -25,12 +25,22 @@ const STUB = `<script>window.google = { script: { run: (function () {
 function render(gas) {
   let html = gas.readSrc('Index');
   html = html.replace(/<\?!= include\('(\w+)'\); \?>/g, (_, n) => gas.readSrc(n));
-  const boot = JSON.stringify({ build: 'dev' + STARTED, catalog: JSON.parse(gas.readSrc('map_catalog')), progress: gas.ctx.summary_(), settings: gas.ctx.getSettings_() }).replace(/</g, '\\u003c');
+  const boot = JSON.stringify({ build: 'dev' + STARTED, base: process.env.NO_BASE ? '' : '/maps/', catalog: JSON.parse(gas.readSrc('map_catalog')), progress: gas.ctx.summary_(), settings: gas.ctx.getSettings_() }).replace(/</g, '\\u003c');
   return html.replace('<?!= boot ?>', boot).replace('<head>', '<head><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">' + STUB);
 }
 
 http.createServer((req, res) => {
   const gas = load(STATE);
+  if (req.url.startsWith('/maps/')) {
+    // stands in for the static map host (GitHub Pages)
+    const f = path.join(__dirname, '..', 'maps', decodeURIComponent(req.url.slice(6).split('?')[0]).replace(/\.\./g, ''));
+    require('fs').readFile(f, (err, buf) => {
+      if (err) { res.writeHead(404); res.end('not found'); return; }
+      res.writeHead(200, { 'Content-Type': f.endsWith('.json') ? 'application/json' : f.endsWith('.webp') ? 'image/webp' : 'application/octet-stream', 'Access-Control-Allow-Origin': '*' });
+      res.end(buf);
+    });
+    return;
+  }
   if (req.url.startsWith('/api/')) {
     let body = '';
     req.on('data', (c) => { body += c; });

@@ -268,4 +268,9 @@ svg.mv.spots .mk circle.hov { fill: var(--accent-soft); stroke: var(--accent); s
 svg.mv.spots .mk circle.out { opacity: .35; }
 svg.mv.spots .lb text { font-size: calc(var(--u, 10) * 11.5px); }
 svg.mv.spots .lb text.f { font-size: calc(var(--u, 10) * 13px); }
+/* terrain backdrop */
+svg.mv image.terrain { pointer-events: none; opacity: .92; }
+svg.mv.ter .base { fill: none; }
+.zoombtns button.on { background: var(--accent-soft); }
+@media (prefers-color-scheme: dark) { svg.mv image.terrain { opacity: .38; } }
 </style>

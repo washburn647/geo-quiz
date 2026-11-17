@@ -43,6 +43,7 @@ function api(fn, ...args) {
 // ---------- app state ----------
 const S = {
   build: BOOT.build,
+  base: BOOT.base || '', // static host for map files ('' = served by the script)
   catalog: BOOT.catalog,
   progress: BOOT.progress || { maps: {}, days: {}, recent: [], totals: { plays: 0, secs: 0 } },
   settings: Object.assign({ pins: ['us-vt-towns', 'us-vt-counties'], sound: true }, BOOT.settings || {}),
@@ -57,6 +58,13 @@ async function loadPack(id) {
   const key = 'map:' + id;
   const cached = store.get(key);
   let txt = cached && cached.b === S.build ? cached.t : null;
+  if (!txt && S.base) {
+    // from the static host (the browser's own cache keeps it); the script's copy is the fallback
+    try {
+      const r = await fetch(S.base + id + '.json?v=' + encodeURIComponent(S.build));
+      if (r.ok) { const p = JSON.parse(await r.text()); prepPack(p); return (packCache[id] = p); }
+    } catch (e) { /* fall through */ }
+  }
   if (!txt) {
     txt = await api('getMap', id);
     if (!store.set(key, { b: S.build, t: txt })) {
